@@ -109,6 +109,11 @@ fn set_hook() -> Result<HHOOK, u32> {
 /// `Event::Key`. The error is the Windows error code.
 pub fn install(proxy: EventLoopProxy<Event>) -> Result<Hook, u32> {
     let _ = PROXY.set(proxy);
+    spawn_hook_thread()
+}
+
+/// The hook on its own thread, with nowhere to send keys yet.
+pub fn spawn_hook_thread() -> Result<Hook, u32> {
     let (tx, rx) = std::sync::mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("gliff-keys".into())

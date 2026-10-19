@@ -56,6 +56,79 @@ pub fn start(proxy: EventLoopProxy<Event>) {
     });
 }
 
+/// The same check with a bare Win32 window and no winit, to tell a winit
+/// effect from one of this process (`GLIFF_HOOK=plain`).
+pub fn plain() {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow, PeekMessageW,
+        SetForegroundWindow, TranslateMessage, MSG, PM_REMOVE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    };
+
+    let _hook = match capture::spawn_hook_thread() {
+        Ok(hook) => hook,
+        Err(code) => {
+            eprintln!("probe: cannot install the hook (error {code})");
+            return;
+        }
+    };
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (class, title) = (wide("STATIC"), wide("gliff probe"));
+    // SAFETY: a built-in window class and NUL-terminated strings that
+    // outlive the call; no parent, menu or creation data.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            100,
+            100,
+            400,
+            300,
+            0,
+            0,
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        )
+    };
+    if hwnd == 0 {
+        eprintln!("probe: cannot create a plain window");
+        return;
+    }
+    capture::set_window(hwnd);
+    // SAFETY: our own window handle.
+    unsafe { SetForegroundWindow(hwnd) };
+    let typist = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(800));
+        eprintln!("probe: sending vk 0x41 to the plain window");
+        send(0x41, 0x1E, false);
+        send(0x41, 0x1E, true);
+    });
+    let until = std::time::Instant::now() + Duration::from_millis(2000);
+    // SAFETY: an all-zero MSG is a valid out value.
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    while std::time::Instant::now() < until {
+        // SAFETY: `msg` is a valid MSG; messages are dispatched as read.
+        unsafe {
+            while PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = typist.join();
+    // SAFETY: no preconditions.
+    let front = unsafe { GetForegroundWindow() } == hwnd;
+    eprintln!(
+        "probe: plain window in front: {front}; hook calls: {}",
+        capture::calls()
+    );
+    // SAFETY: our own window, destroyed once.
+    unsafe { DestroyWindow(hwnd) };
+}
+
 fn send(vk: u16, scan: u16, up: bool) {
     let input = INPUT {
         r#type: INPUT_KEYBOARD,

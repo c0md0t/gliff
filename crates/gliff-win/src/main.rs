@@ -647,6 +647,11 @@ fn main() -> std::process::ExitCode {
         )
         .init();
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if cli.probe_keys && std::env::var("GLIFF_HOOK").is_ok_and(|v| v == "plain") {
+        probe::plain();
+        return std::process::ExitCode::SUCCESS;
+    }
     let event_loop = match EventLoop::<Event>::with_user_event().build() {
         Ok(l) => l,
         Err(e) => {
