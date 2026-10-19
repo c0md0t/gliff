@@ -49,6 +49,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p gliff-win --locked
       - run: cargo build -p gliff-win --release --locked
+      # Where typed keys land with the window in front: the hook or only
+      # winit. Informational until capture is understood on CI desktops.
+      - name: Probe keyboard capture
+        continue-on-error: true
+        timeout-minutes: 2
+        run: target/release/gliff-win.exe --probe-keys
       - uses: actions/upload-artifact@v4
         with:
           name: gliff-win

@@ -9,6 +9,8 @@
 mod capture;
 mod keys;
 mod net;
+#[cfg(windows)]
+mod probe;
 mod view;
 
 use std::collections::HashSet;
@@ -44,7 +46,7 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(200);
 )]
 struct Cli {
     /// `user@host` (or an ssh config alias) to ssh to and spawn gliff-server.
-    #[arg(required_unless_present = "connect")]
+    #[arg(required_unless_present_any = ["connect", "probe_keys"])]
     host: Option<String>,
     /// Dev: connect directly to a `gliff-server --listen` address.
     #[arg(long, conflicts_with = "host")]
@@ -62,6 +64,10 @@ struct Cli {
     /// Start full screen. Ctrl+Alt+Enter toggles it at any time.
     #[arg(long)]
     fullscreen: bool,
+    /// Test: open the window without a server, type A and B into it, and
+    /// report where each key arrived (Windows only).
+    #[arg(long, hide = true)]
+    probe_keys: bool,
 }
 
 /// How to drive the window from the keyboard, printed once connected.
@@ -164,6 +170,9 @@ impl App {
     /// A key from the hook or from winit, as an evdev code. Handles the two
     /// local hotkeys; everything else goes to the remote.
     fn on_key(&mut self, keycode: u32, pressed: bool, source: &str) {
+        if self.cli.probe_keys {
+            eprintln!("probe: key evdev {keycode} pressed {pressed} from {source}");
+        }
         if !self.first_key_noted {
             self.first_key_noted = true;
             eprintln!(
@@ -444,6 +453,11 @@ impl ApplicationHandler<Event> for App {
                 event_loop.exit();
                 return;
             }
+        }
+        #[cfg(windows)]
+        if self.cli.probe_keys {
+            probe::start(self.proxy.clone());
+            return;
         }
         // ssh asks for host keys and passwords on the console, which this
         // window covers on first connect.
