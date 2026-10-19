@@ -15,7 +15,7 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetForegroundWindow, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, WH_KEYBOARD_LL,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, WH_KEYBOARD_LL,
 };
 use winit::event_loop::EventLoopProxy;
 
@@ -121,6 +121,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 /// Decide whether the hook keeps this key from Windows, posting it to the
 /// event loop if so.
 fn take(kb: &KBDLLHOOKSTRUCT) -> bool {
+    // Synthesised keys (winit's focus request, AutoHotkey and the like)
+    // belong to whoever sent them.
+    if kb.flags & LLKHF_INJECTED != 0 {
+        return false;
+    }
     let extended = kb.flags & LLKHF_EXTENDED != 0;
     let up = kb.flags & LLKHF_UP != 0;
     // Identifies the physical key across its press and release.

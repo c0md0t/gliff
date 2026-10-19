@@ -120,6 +120,10 @@ struct App {
     /// The keyboard was handed back with the release hotkey; a click on the
     /// picture takes it again.
     released: bool,
+    /// One-shot console notes for diagnosing keys that do not arrive.
+    first_key_noted: bool,
+    #[cfg(windows)]
+    stray_key_noted: bool,
     /// The Windows keyboard hook. While it is installed it is the only
     /// source of keys; winit's own key events are ignored.
     #[cfg(windows)]
@@ -143,6 +147,9 @@ impl App {
             video: String::new(),
             exit_error: None,
             released: false,
+            first_key_noted: false,
+            #[cfg(windows)]
+            stray_key_noted: false,
             #[cfg(windows)]
             hook: None,
         }
@@ -157,7 +164,14 @@ impl App {
 
     /// A key from the hook or from winit, as an evdev code. Handles the two
     /// local hotkeys; everything else goes to the remote.
-    fn on_key(&mut self, keycode: u32, pressed: bool) {
+    fn on_key(&mut self, keycode: u32, pressed: bool, source: &str) {
+        if !self.first_key_noted {
+            self.first_key_noted = true;
+            eprintln!(
+                "gliff: first key reached the window from {source} (evdev {keycode}, released: {})",
+                self.released
+            );
+        }
         if self.released {
             return;
         }
@@ -412,7 +426,11 @@ impl ApplicationHandler<Event> for App {
             Ok(gfx) => {
                 #[cfg(windows)]
                 {
+                    // A window opened from a terminal can be left without
+                    // the keyboard focus, which stays with the terminal.
+                    gfx.window.focus_window();
                     self.hook = install_hook(&gfx.window, self.proxy.clone());
+                    capture::set_focused(gfx.window.has_focus());
                 }
                 self.gfx = Some(gfx);
             }
@@ -476,7 +494,7 @@ impl ApplicationHandler<Event> for App {
                 hot_y,
                 argb,
             } => self.set_cursor(event_loop, width, height, (hot_x, hot_y), &argb),
-            Event::Key { keycode, pressed } => self.on_key(keycode, pressed),
+            Event::Key { keycode, pressed } => self.on_key(keycode, pressed, "the keyboard hook"),
             Event::Error(e) => {
                 self.exit_error = Some(e);
                 event_loop.exit();
@@ -507,7 +525,20 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if self.hooked() || event.repeat {
+                if self.hooked() {
+                    // The hook should have taken this key. Windows drops a
+                    // hook that answers too slowly, so say so once.
+                    #[cfg(windows)]
+                    if !self.released && !self.stray_key_noted {
+                        self.stray_key_noted = true;
+                        eprintln!(
+                            "gliff: a key reached the window past the keyboard hook ({:?})",
+                            event.physical_key
+                        );
+                    }
+                    return;
+                }
+                if event.repeat {
                     return;
                 }
                 let PhysicalKey::Code(code) = event.physical_key else {
@@ -517,7 +548,7 @@ impl ApplicationHandler<Event> for App {
                     tracing::debug!(?code, "no evdev code for key");
                     return;
                 };
-                self.on_key(keycode, event.state == ElementState::Pressed);
+                self.on_key(keycode, event.state == ElementState::Pressed, "winit");
             }
             WindowEvent::CursorMoved { position, .. } => self.pointer_motion(position),
             WindowEvent::MouseInput { state, button, .. } => {
