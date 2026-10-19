@@ -3,20 +3,29 @@
 //! thread. Input flows the other way as ready-made `ClientMsg`s.
 //!
 //! This is the CPU tier of the GTK client's `net.rs`, without the GPU
-//! decoder or clipboard sharing.
+//! decoder. Clipboard sharing covers text and images, fetched as soon as
+//! the server offers them.
 
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
-use gliff_proto::clipboard::CHUNK;
+use gliff_proto::clipboard::{resolve_mime, CHUNK, MAX_ITEM, TEXT_MIME};
 use gliff_proto::{
-    features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardMsg,
-    Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
+    features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardItem,
+    ClipboardMsg, Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
+};
+use gliff_transport::clipboard::{
+    outbound_channel, ChunkSink, Event as TransferEvent, Side, Transfers,
 };
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
+
+use crate::clip::{self, Content, PNG_MIME};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use winit::event_loop::EventLoopProxy;
@@ -97,21 +106,104 @@ pub fn spawn(
     endpoint: Endpoint,
     proxy: EventLoopProxy<Event>,
     slot: Slot,
+    clipboard: bool,
 ) -> UnboundedSender<ClientMsg> {
     let (tx, rx) = unbounded_channel();
     std::thread::Builder::new()
         .name("gliff-net".into())
-        .spawn(move || run(endpoint, proxy, slot, rx))
+        .spawn(move || run(endpoint, proxy, slot, rx, clipboard))
         .expect("spawn network thread");
     tx
+}
+
+/// The session's end of the clipboard thread.
+struct ClipIo {
+    /// Content to put on the local clipboard.
+    set: std_mpsc::Sender<Content>,
+    /// Local clipboard changes.
+    local: UnboundedReceiver<Content>,
+}
+
+impl ClipIo {
+    fn start() -> Option<Self> {
+        let (local_tx, local) = unbounded_channel();
+        let set = clip::spawn(local_tx)?;
+        Some(Self { set, local })
+    }
+}
+
+/// The next local clipboard change, or never without a clipboard.
+async fn next_local(clip: &mut Option<ClipIo>) -> Content {
+    match clip {
+        Some(io) => match io.local.recv().await {
+            Some(content) => content,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Collects a fetched item in memory.
+struct Collect(Rc<RefCell<Vec<u8>>>);
+
+impl ChunkSink for Collect {
+    async fn write(&mut self, chunk: Bytes) -> std::io::Result<()> {
+        self.0.borrow_mut().extend_from_slice(&chunk);
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Fetch the server's offer `serial` (text, else a PNG image) and put it
+/// on the local clipboard, unless a newer offer came in meanwhile.
+async fn take_offer(
+    transfers: Transfers,
+    serial: u32,
+    mime_types: Vec<String>,
+    set: std_mpsc::Sender<Content>,
+    latest: Rc<Cell<u32>>,
+) {
+    let mime = match resolve_mime(TEXT_MIME, &mime_types) {
+        Some(m) => m.to_string(),
+        None if mime_types.iter().any(|m| m == PNG_MIME) => PNG_MIME.to_string(),
+        None => return,
+    };
+    let data = Rc::new(RefCell::new(Vec::new()));
+    let fetched = transfers
+        .fetch(
+            ClipboardItem::Mime(mime.clone()),
+            serial,
+            Collect(data.clone()),
+            Some(MAX_ITEM),
+        )
+        .await;
+    if let Err(e) = fetched {
+        tracing::warn!(error = %e, mime, "cannot fetch the remote clipboard");
+        return;
+    }
+    if latest.get() != serial {
+        return;
+    }
+    let data = data.take();
+    let content = if mime == PNG_MIME {
+        Content::Png(data.into())
+    } else {
+        Content::Text(String::from_utf8_lossy(&data).into_owned())
+    };
+    let _ = set.send(content);
 }
 
 fn run(
     endpoint: Endpoint,
     proxy: EventLoopProxy<Event>,
     slot: Slot,
-    input: UnboundedReceiver<ClientMsg>,
+    mut input: UnboundedReceiver<ClientMsg>,
+    clipboard: bool,
 ) {
+    let mut clip = if clipboard { ClipIo::start() } else { None };
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -132,13 +224,13 @@ fn run(
                     .with_context(|| format!("connect to {addr}"))?;
                 stream.set_nodelay(true)?;
                 let (rd, wr) = tokio::io::split(stream);
-                session(rd, wr, events, slot, input).await
+                session(rd, wr, events, slot, &mut input, &mut clip).await
             }
             Endpoint::Ssh(target) => {
                 let ssh = spawn_ssh(&target).context("start ssh")?;
                 // Keep the child alive for the session; dropping it kills ssh.
                 let _child = ssh.child;
-                session(ssh.stdout, ssh.stdin, events, slot, input).await
+                session(ssh.stdout, ssh.stdin, events, slot, &mut input, &mut clip).await
             }
         }
     });
@@ -166,7 +258,8 @@ async fn session<R, W>(
     wr: W,
     events: EventLoopProxy<Event>,
     slot: Slot,
-    mut input: UnboundedReceiver<ClientMsg>,
+    input: &mut UnboundedReceiver<ClientMsg>,
+    clip: &mut Option<ClipIo>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + 'static,
@@ -244,13 +337,40 @@ where
 
     // Writes run on their own task so reads (draining video) never block on
     // a write and the two peers cannot deadlock.
-    let (out_tx, mut out_rx) = unbounded_channel::<ClientMsg>();
+    // A message's payload (a clipboard chunk) follows its header.
+    let (out_tx, mut out_rx) = unbounded_channel::<(ClientMsg, Bytes)>();
     let mut writes = tokio::task::spawn_local(async move {
-        while let Some(m) = out_rx.recv().await {
-            writer.write_msg(&m).await?;
+        while let Some((m, payload)) = out_rx.recv().await {
+            if payload.is_empty() {
+                writer.write_msg(&m).await?;
+            } else {
+                writer.write_msg_with_payloads(&m, &[&payload]).await?;
+            }
         }
         Ok::<(), gliff_transport::Error>(())
     });
+    let send = |m: ClientMsg| {
+        let _ = out_tx.send((m, Bytes::new()));
+    };
+
+    // Clipboard transfers write through the same channel, in chunks.
+    let (clip_out_tx, mut clip_out_rx) = outbound_channel();
+    let transfers = Transfers::new(clip_out_tx, Side::Client);
+    {
+        let out_tx = out_tx.clone();
+        tokio::task::spawn_local(async move {
+            while let Some((m, payload)) = clip_out_rx.recv().await {
+                if out_tx.send((ClientMsg::from(m), payload)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // Our latest offer, which the server's requests must name.
+    let mut offered: Option<(u32, Content)> = None;
+    let mut offer_serial = 0u32;
+    // The server's latest offer; an older fetch finishing late is dropped.
+    let remote_serial = Rc::new(Cell::new(0u32));
 
     let mut frames_since = 0u32;
     let mut bytes_since = 0u64;
@@ -277,12 +397,27 @@ where
             read = reader.read_msg::<ServerMsg>() => read,
             msg = input.recv() => match msg {
                 Some(m) => {
-                    let _ = out_tx.send(m);
+                    send(m);
                     continue;
                 }
                 // The window closed.
                 None => return Ok(()),
             },
+            content = next_local(clip) => {
+                tracing::debug!(mime = content.mime(), "offering our clipboard");
+                offer_serial = offer_serial.wrapping_add(1);
+                let offer = ClipboardMsg::Offer {
+                    serial: offer_serial,
+                    mime_types: vec![content.mime().to_string()],
+                    files: Vec::new(),
+                };
+                offered = Some((offer_serial, content));
+                let transfers = transfers.clone();
+                tokio::task::spawn_local(async move {
+                    let _ = transfers.send(offer).await;
+                });
+                continue;
+            }
             written = &mut writes => {
                 written.context("writer task")?.context("write to server")?;
                 return Ok(());
@@ -327,7 +462,7 @@ where
                 let decoded = decoder.decode(&main, &aux);
                 let dec_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 // Ack every frame at once so the server keeps pacing.
-                let _ = out_tx.send(ClientMsg::FrameAck {
+                send(ClientMsg::FrameAck {
                     frame_id,
                     decoded_at_ms: now_ms(),
                 });
@@ -347,7 +482,7 @@ where
                     Err(e) => {
                         tracing::warn!(error = %e, "decode error; requesting keyframe");
                         in_decoder.clear();
-                        let _ = out_tx.send(ClientMsg::RequestKeyframe);
+                        send(ClientMsg::RequestKeyframe);
                     }
                 }
             }
@@ -393,7 +528,7 @@ where
                 });
             }
             ServerMsg::Ping { t } => {
-                let _ = out_tx.send(ClientMsg::Pong { t });
+                send(ClientMsg::Pong { t });
             }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::HelloAck { .. } => {}
             ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
@@ -403,23 +538,60 @@ where
                 anyhow::bail!("server error {code}: {message}")
             }
             other => {
-                // No clipboard sharing yet: offers are ignored, so the
-                // server never sends data unasked, but any payload must
-                // still be read to keep the framing in step.
-                if let Ok(clip) = other.into_clipboard() {
-                    match clip {
-                        ClipboardMsg::Data { data_len, .. } => {
-                            anyhow::ensure!(
-                                data_len as usize <= CHUNK,
-                                "clipboard chunk of {data_len} bytes exceeds the limit"
-                            );
-                            reader.read_payload(data_len).await?;
-                        }
-                        ClipboardMsg::Request { id, .. } => {
-                            let _ = out_tx.send(ClientMsg::ClipboardAbort { id });
-                        }
-                        _ => {}
+                let Ok(msg) = other.into_clipboard() else {
+                    continue;
+                };
+                // A chunk's payload is read even when clipboard sharing is
+                // off, to keep the framing in step.
+                let payload = match &msg {
+                    ClipboardMsg::Data { data_len, .. } => {
+                        anyhow::ensure!(
+                            *data_len as usize <= CHUNK,
+                            "clipboard chunk of {data_len} bytes exceeds the limit"
+                        );
+                        reader.read_payload(*data_len).await?
                     }
+                    _ => Bytes::new(),
+                };
+                match transfers.on_msg(msg, payload) {
+                    Some(TransferEvent::Offer {
+                        serial, mime_types, ..
+                    }) => {
+                        tracing::debug!(serial, ?mime_types, "server offers its clipboard");
+                        if let Some(io) = clip {
+                            remote_serial.set(serial);
+                            tokio::task::spawn_local(take_offer(
+                                transfers.clone(),
+                                serial,
+                                mime_types,
+                                io.set.clone(),
+                                remote_serial.clone(),
+                            ));
+                        }
+                    }
+                    Some(TransferEvent::Request { id, serial, item }) => match (&offered, item) {
+                        (Some((s, content)), ClipboardItem::Mime(mime))
+                            if *s == serial && content.serves(&mime) =>
+                        {
+                            let (tx, rx) = tokio::sync::mpsc::channel(4);
+                            let data = content.bytes();
+                            tokio::task::spawn_local(async move {
+                                for start in (0..data.len()).step_by(CHUNK) {
+                                    let end = (start + CHUNK).min(data.len());
+                                    if tx.send(Ok(data.slice(start..end))).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                            tracing::debug!(id, serial, mime, "serving our clipboard");
+                            transfers.serve(id, rx);
+                        }
+                        _ => {
+                            tracing::debug!(id, serial, "refusing a clipboard request");
+                            transfers.refuse(id)
+                        }
+                    },
+                    None => {}
                 }
             }
         }

@@ -7,6 +7,7 @@
 
 #[cfg(windows)]
 mod capture;
+mod clip;
 mod keys;
 mod net;
 #[cfg(windows)]
@@ -61,6 +62,9 @@ struct Cli {
     /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
     #[arg(long)]
     output: Option<String>,
+    /// Disable clipboard sharing in both directions.
+    #[arg(long)]
+    no_clipboard: bool,
     /// Start full screen. Ctrl+Alt+Enter toggles it at any time.
     #[arg(long)]
     fullscreen: bool,
@@ -457,6 +461,7 @@ impl ApplicationHandler<Event> for App {
             self.cli.endpoint(),
             self.proxy.clone(),
             self.slot.clone(),
+            !self.cli.no_clipboard,
         ));
     }
 
