@@ -231,6 +231,7 @@ pub fn evdev_from_set1(scan: u32, extended: bool, vk: u32) -> Option<u32> {
             0x36 => KEY_RIGHTSHIFT,
             0x37 => 99, // KEY_SYSRQ (Print Screen)
             0x38 => KEY_RIGHTALT,
+            0x46 => 119, // Ctrl+Break, which is Pause
             0x47 => 102, // KEY_HOME
             0x48 => 103, // KEY_UP
             0x49 => 104, // KEY_PAGEUP
@@ -256,6 +257,8 @@ pub fn evdev_from_set1(scan: u32, extended: bool, vk: u32) -> Option<u32> {
             0x6B => 157, // KEY_COMPUTER
             0x6C => 155, // KEY_MAIL
             0x6D => 226, // KEY_MEDIA
+            0xF1 => 123, // KEY_HANJA
+            0xF2 => 122, // KEY_HANGEUL
             _ => return None,
         });
     }
@@ -269,6 +272,8 @@ pub fn evdev_from_set1(scan: u32, extended: bool, vk: u32) -> Option<u32> {
         0x59 => 117,                      // KEY_KPEQUAL
         0x64..=0x6E => scan - 0x64 + 183, // KEY_F13..KEY_F23
         0x70 => 93,                       // KEY_KATAKANAHIRAGANA
+        0x71 => 123,                      // KEY_HANJA
+        0x72 => 122,                      // KEY_HANGEUL
         0x73 => 89,                       // KEY_RO
         0x76 => 194,                      // KEY_F24
         0x79 => 92,                       // KEY_HENKAN
