@@ -39,7 +39,7 @@ static OUR_HWND: AtomicIsize = AtomicIsize::new(0);
 static PROXY: OnceLock<EventLoopProxy<Event>> = OnceLock::new();
 
 /// Key presses reported on the console, for diagnosing capture.
-const REPORT_PRESSES: u32 = 3;
+const REPORT_PRESSES: u32 = 8;
 
 thread_local! {
     /// Keys whose press the hook took, so it takes their release too, even
@@ -141,7 +141,7 @@ pub fn set_window(hwnd: isize) {
 /// foreground window, its owner and class (`ConsoleWindowClass` is a
 /// console, `CASCADIA_HOSTING_WINDOW_CLASS` Windows Terminal), and the
 /// active and focus windows of the foreground thread.
-fn report_press(vk: u32, focused: bool, front: bool, active: bool) {
+fn report_press(vk: u32, injected: bool, focused: bool, front: bool, active: bool) {
     // SAFETY: these calls have no preconditions beyond valid out pointers,
     // which `pid`, `class` and `gti` (with its size set) are.
     let (fg, pid, class, gti) = unsafe {
@@ -158,14 +158,35 @@ fn report_press(vk: u32, focused: bool, front: bool, active: bool) {
     // SAFETY: GetCurrentProcessId has no preconditions.
     let our_pid = unsafe { GetCurrentProcessId() };
     eprintln!(
-        "gliff: key {vk:#x} pressed: capture {} (winit focused {focused}, capturing {active}); \
+        "gliff: key {vk:#x} pressed{}: capture {} (winit focused {focused}, capturing {active}); \
          front window {fg:#x} pid {pid} class {class:?} active {:#x} focus {:#x}; \
          ours {:#x} pid {our_pid}",
+        if injected { " (injected)" } else { "" },
         if front && active { "on" } else { "off" },
         gti.hwndActive,
         gti.hwndFocus,
         OUR_HWND.load(Ordering::Relaxed),
     );
+}
+
+/// Windows names our window as the active or focus window of the
+/// foreground thread: true even when that thread's input is joined to
+/// another process's, as with a console that started us.
+fn ours_has_focus() -> bool {
+    let ours = OUR_HWND.load(Ordering::Relaxed);
+    if ours == 0 {
+        return false;
+    }
+    // SAFETY: `gti` is a valid GUITHREADINFO with its size set.
+    let gti = unsafe {
+        let mut gti: GUITHREADINFO = std::mem::zeroed();
+        gti.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(0, &mut gti) == 0 {
+            return false;
+        }
+        gti
+    };
+    gti.hwndActive == ours || gti.hwndFocus == ours
 }
 
 /// The foreground window belongs to this process.
@@ -199,11 +220,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 /// Decide whether the hook keeps this key from Windows, posting it to the
 /// event loop if so.
 fn take(kb: &KBDLLHOOKSTRUCT) -> bool {
-    // Synthesised keys (winit's focus request, AutoHotkey and the like)
-    // belong to whoever sent them.
-    if kb.flags & LLKHF_INJECTED != 0 {
-        return false;
-    }
+    // Injected keys are taken too: keyboard utilities that hook the
+    // keyboard themselves re-send every key as injected, so on such a
+    // machine all typing arrives that way.
+    let injected = kb.flags & LLKHF_INJECTED != 0;
     let extended = kb.flags & LLKHF_EXTENDED != 0;
     let up = kb.flags & LLKHF_UP != 0;
     // Identifies the physical key across its press and release.
@@ -214,12 +234,12 @@ fn take(kb: &KBDLLHOOKSTRUCT) -> bool {
         }
     } else {
         let focused = FOCUSED.load(Ordering::Relaxed);
-        let front = focused || ours_in_front();
+        let front = focused || ours_in_front() || ours_has_focus();
         let active = ACTIVE.load(Ordering::Relaxed);
         let n = REPORTED.get();
         if n < REPORT_PRESSES {
             REPORTED.set(n + 1);
-            report_press(kb.vkCode, focused, front, active);
+            report_press(kb.vkCode, injected, focused, front, active);
         }
         if !(front && active) {
             return false;
