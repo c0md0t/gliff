@@ -331,7 +331,9 @@ impl ApplicationHandler<Event> for App {
                 return;
             }
         }
-        self.set_title("connecting…");
+        // ssh asks for host keys and passwords on the console, which this
+        // window covers on first connect.
+        self.set_title("connecting… (answer any ssh prompt in the terminal)");
         self.input = Some(net::spawn(
             self.cli.endpoint(),
             self.proxy.clone(),
