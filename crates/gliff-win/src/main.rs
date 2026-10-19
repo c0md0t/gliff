@@ -437,7 +437,9 @@ impl ApplicationHandler<Event> for App {
                     // A window opened from a terminal can be left without
                     // the keyboard focus, which stays with the terminal.
                     gfx.window.focus_window();
-                    self.hook = install_hook(self.proxy.clone());
+                    if self.hook.is_none() {
+                        self.hook = install_hook(self.proxy.clone());
+                    }
                     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
                     if let Ok(RawWindowHandle::Win32(w)) =
                         gfx.window.window_handle().map(|h| h.as_raw())
@@ -617,7 +619,15 @@ impl ApplicationHandler<Event> for App {
 /// check when they do not.
 #[cfg(windows)]
 fn install_hook(proxy: EventLoopProxy<Event>) -> Option<capture::Hook> {
-    match capture::install(proxy) {
+    // GLIFF_HOOK=main puts the hook on the event loop thread, to compare
+    // with its own thread when testing capture.
+    let here = std::env::var("GLIFF_HOOK").is_ok_and(|v| v == "main");
+    let hook = if here {
+        capture::install_here(proxy)
+    } else {
+        capture::install(proxy)
+    };
+    match hook {
         Ok(hook) => {
             eprintln!("gliff: keyboard hook installed");
             Some(hook)
@@ -645,6 +655,19 @@ fn main() -> std::process::ExitCode {
         }
     };
     let mut app = App::new(cli, event_loop.create_proxy());
+    // GLIFF_HOOK=early installs the hook before any window exists, and
+    // GLIFF_HOOK=noconsole detaches from the console first: both for
+    // testing capture.
+    #[cfg(windows)]
+    match std::env::var("GLIFF_HOOK").as_deref() {
+        Ok("early") => app.hook = install_hook(event_loop.create_proxy()),
+        Ok("noconsole") => {
+            // SAFETY: FreeConsole has no preconditions.
+            let freed = unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+            eprintln!("gliff: detached from the console: {}", freed != 0);
+        }
+        _ => {}
+    }
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("gliff: {e}");
         return std::process::ExitCode::FAILURE;

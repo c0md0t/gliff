@@ -53,8 +53,14 @@ jobs:
       # winit. Informational until capture is understood on CI desktops.
       - name: Probe keyboard capture
         continue-on-error: true
-        timeout-minutes: 2
-        run: target/release/gliff-win.exe --probe-keys
+        timeout-minutes: 4
+        shell: cmd
+        run: |
+          for %%v in (thread main early noconsole) do (
+            echo === GLIFF_HOOK=%%v
+            set GLIFF_HOOK=%%v
+            target\release\gliff-win.exe --probe-keys 2>&1
+          )
       - uses: actions/upload-artifact@v4
         with:
           name: gliff-win
