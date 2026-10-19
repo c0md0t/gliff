@@ -13,17 +13,17 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MSG, PM_NOREMOVE,
-    WH_KEYBOARD_LL, WM_QUIT, WM_USER,
+    CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo,
+    GetMessageW, GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, GUITHREADINFO, HC_ACTION, KBDLLHOOKSTRUCT,
+    LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_QUIT, WM_USER,
 };
 use winit::event_loop::EventLoopProxy;
 
@@ -32,6 +32,10 @@ use crate::net::Event;
 
 /// Capture is on: not handed back with the release hotkey.
 static ACTIVE: AtomicBool = AtomicBool::new(true);
+/// Our window is active, as winit reports it.
+static FOCUSED: AtomicBool = AtomicBool::new(false);
+/// Our window's handle, for the console diagnostics.
+static OUR_HWND: AtomicIsize = AtomicIsize::new(0);
 static PROXY: OnceLock<EventLoopProxy<Event>> = OnceLock::new();
 
 /// Key presses reported on the console, for diagnosing capture.
@@ -123,6 +127,47 @@ pub fn set_active(active: bool) {
     ACTIVE.store(active, Ordering::Relaxed);
 }
 
+/// Follow winit's focus events for our window.
+pub fn set_focused(focused: bool) {
+    FOCUSED.store(focused, Ordering::Relaxed);
+}
+
+/// Our window's handle, for the console diagnostics.
+pub fn set_window(hwnd: isize) {
+    OUR_HWND.store(hwnd, Ordering::Relaxed);
+}
+
+/// Print who Windows thinks is in front when a key is pressed: the
+/// foreground window, its owner and class (`ConsoleWindowClass` is a
+/// console, `CASCADIA_HOSTING_WINDOW_CLASS` Windows Terminal), and the
+/// active and focus windows of the foreground thread.
+fn report_press(vk: u32, focused: bool, front: bool, active: bool) {
+    // SAFETY: these calls have no preconditions beyond valid out pointers,
+    // which `pid`, `class` and `gti` (with its size set) are.
+    let (fg, pid, class, gti) = unsafe {
+        let fg = GetForegroundWindow();
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, &mut pid);
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(fg, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+        let mut gti: GUITHREADINFO = std::mem::zeroed();
+        gti.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        GetGUIThreadInfo(0, &mut gti);
+        (fg, pid, String::from_utf16_lossy(&class[..n]), gti)
+    };
+    // SAFETY: GetCurrentProcessId has no preconditions.
+    let our_pid = unsafe { GetCurrentProcessId() };
+    eprintln!(
+        "gliff: key {vk:#x} pressed: capture {} (winit focused {focused}, capturing {active}); \
+         front window {fg:#x} pid {pid} class {class:?} active {:#x} focus {:#x}; \
+         ours {:#x} pid {our_pid}",
+        if front && active { "on" } else { "off" },
+        gti.hwndActive,
+        gti.hwndFocus,
+        OUR_HWND.load(Ordering::Relaxed),
+    );
+}
+
 /// The foreground window belongs to this process.
 fn ours_in_front() -> bool {
     // SAFETY: these calls have no preconditions; `pid` is a valid out
@@ -168,15 +213,13 @@ fn take(kb: &KBDLLHOOKSTRUCT) -> bool {
             return false;
         }
     } else {
-        let front = ours_in_front();
+        let focused = FOCUSED.load(Ordering::Relaxed);
+        let front = focused || ours_in_front();
         let active = ACTIVE.load(Ordering::Relaxed);
         let n = REPORTED.get();
         if n < REPORT_PRESSES {
             REPORTED.set(n + 1);
-            eprintln!(
-                "gliff: key {:#x} pressed (gliff in front: {front}, capturing: {active})",
-                kb.vkCode
-            );
+            report_press(kb.vkCode, focused, front, active);
         }
         if !(front && active) {
             return false;

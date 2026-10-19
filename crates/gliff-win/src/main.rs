@@ -124,8 +124,9 @@ struct App {
     first_key_noted: bool,
     #[cfg(windows)]
     stray_key_noted: bool,
-    /// The Windows keyboard hook. While it is installed it is the only
-    /// source of keys; winit's own key events are ignored.
+    /// The Windows keyboard hook, which takes keys (Win and Alt+Tab
+    /// included) while our window is active; keys it lets through still
+    /// reach us as winit key events.
     #[cfg(windows)]
     hook: Option<capture::Hook>,
 }
@@ -155,11 +156,9 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
     fn hooked(&self) -> bool {
-        #[cfg(windows)]
-        return self.hook.is_some();
-        #[cfg(not(windows))]
-        return false;
+        self.hook.is_some()
     }
 
     /// A key from the hook or from winit, as an evdev code. Handles the two
@@ -430,6 +429,13 @@ impl ApplicationHandler<Event> for App {
                     // the keyboard focus, which stays with the terminal.
                     gfx.window.focus_window();
                     self.hook = install_hook(self.proxy.clone());
+                    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                    if let Ok(RawWindowHandle::Win32(w)) =
+                        gfx.window.window_handle().map(|h| h.as_raw())
+                    {
+                        capture::set_window(w.hwnd.get());
+                    }
+                    capture::set_focused(gfx.window.has_focus());
                 }
                 self.gfx = Some(gfx);
             }
@@ -516,23 +522,35 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Focused(false) => self.release_keys(),
-            WindowEvent::KeyboardInput { event, .. } => {
-                if self.hooked() {
-                    // The hook should have taken this key. Windows drops a
-                    // hook that answers too slowly, so say so once.
-                    #[cfg(windows)]
-                    if !self.released && !self.stray_key_noted {
-                        self.stray_key_noted = true;
-                        eprintln!(
-                            "gliff: a key reached the window past the keyboard hook ({:?})",
-                            event.physical_key
-                        );
-                    }
+            WindowEvent::Focused(focused) => {
+                #[cfg(windows)]
+                {
+                    eprintln!("gliff: window focused: {focused}");
+                    capture::set_focused(focused);
+                }
+                if !focused {
+                    self.release_keys();
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                // winit makes up presses and releases for held keys when
+                // focus changes; only real keys go to the remote.
+                if is_synthetic || event.repeat {
                     return;
                 }
-                if event.repeat {
-                    return;
+                // The hook takes keys while it captures; one that reaches
+                // the window anyway is still the user's, so it is sent on.
+                #[cfg(windows)]
+                if self.hooked() && !self.released && !self.stray_key_noted {
+                    self.stray_key_noted = true;
+                    eprintln!(
+                        "gliff: a key reached the window instead of the keyboard hook ({:?} {:?}); sending it on",
+                        event.physical_key, event.state
+                    );
                 }
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
@@ -548,6 +566,14 @@ impl ApplicationHandler<Event> for App {
                 let pressed = state == ElementState::Pressed;
                 if pressed {
                     self.recapture();
+                    // A click should make the window active; if Windows has
+                    // not, ask for it, so the keyboard follows the click.
+                    #[cfg(windows)]
+                    if let Some(gfx) = &self.gfx {
+                        if !gfx.window.has_focus() {
+                            gfx.window.focus_window();
+                        }
+                    }
                 }
                 self.send(ClientMsg::PointerButton {
                     button: keys::evdev_button(button),
