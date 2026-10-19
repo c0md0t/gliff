@@ -19,6 +19,8 @@ both ends, and falls back to the CPU on machines where it cannot.
   exists only for your session and follows the size of your window.
 - Your keyboard layout, not the remote's: keys map the same on both ends.
 - A shared clipboard in both directions: text, images, and copied files.
+- The remote machine's sound, in both directions, so two machines can show
+  each other at once without echo.
 - Quality that adapts to the link, giving up frame rate before sharpness.
 - Reconnection when the link drops.
 - A window that follows your Omarchy theme.
@@ -26,6 +28,8 @@ both ends, and falls back to the CPU on machines where it cannot.
 ## Requirements
 
 - Hyprland on both machines, with a session running on the remote one.
+- For sound from the remote: PipeWire (`pw-record`, `pw-dump`, `pw-link`),
+  or PulseAudio's `parec`.
 - ssh access from your machine to the remote one.
 - For GPU video: an AMD or Intel GPU with its Vulkan and VA-API drivers
   (on Arch, `vulkan-radeon` and `mesa` for AMD, or `vulkan-intel` and
@@ -103,6 +107,14 @@ advertised clipboard contents without a local paste. Use `gliff --no-clipboard`
 to disable sharing in both directions when connecting to an untrusted host.
 Local selections marked `x-kde-passwordManagerHint` are not shared.
 
+**Sound.** The window plays the sound of the machine it shows. The speaker
+button in the header mutes it and remembers that; `gliff --no-audio` starts
+muted. Only the tab you look at plays, and other tabs' hosts stop recording.
+A host sends what its applications play except Gliff itself, so when two
+machines show each other, neither hears its own sound come back. Hosts keep
+playing their sound on their own speakers. Sound is Opus at 128 kbit/s, and
+the client buffers 40 to 250 ms of it, more on a jittery link.
+
 **Slow links.** gliff measures the link and lowers the frame rate, then the
 colour detail, then the resolution, and raises them again when there is
 room. Two flags change the video, and you pass them to the server through
@@ -112,6 +124,42 @@ room. Two flags change the video, and you pass them to the server through
 ```
 gliff --server-bin 'gliff-server --low-bandwidth' user@host
 ```
+
+## From Windows
+
+`gliff-win` is a smaller client for machines without Hyprland, built for
+Windows. It uses Windows' own OpenSSH (`ssh.exe`) to start `gliff-server`
+on the remote, the same way `gliff` does, and decodes on the CPU:
+
+```
+gliff-win.exe user@host
+gliff-win.exe --headless user@host
+gliff-win.exe --install
+```
+
+Run it from a terminal: ssh asks for host keys and passwords there, and
+the server's messages show up there too. It takes `--headless`,
+`--output`, `--server-bin` and `--no-clipboard` like `gliff`, and
+`--fullscreen`. Without a host it connects to the last machine.
+`--install` copies it to `%LOCALAPPDATA%\Programs\gliff`, puts that on
+your PATH, and adds a "gliff" Start menu shortcut that opens full screen.
+
+The clipboard is shared both ways for text and images. When the link
+drops, the window stays open and reconnects. Video is 4:4:4 by default
+(two streams to decode on the CPU); `--chroma 420` halves the decoding
+for slower machines, and the title bar shows the decode time.
+
+While its window is in front, every key goes to the remote, including
+Win, Alt+Tab and Ctrl+Esc, so Hyprland's Super shortcuts work. Windows
+keeps only Ctrl+Alt+Del and Win+L. Ctrl+Alt+Enter toggles full screen,
+and Shift+Esc gives the keyboard back to Windows until you click the
+picture again.
+
+It plays the remote's sound when the server supports it (`--no-audio` to
+keep quiet). It remembers `--server-bin`, so a shortcut reaches the same
+server. So far it has no tabs and no copied files, and the remote uses
+its own keyboard layout. The CI's Windows job builds `gliff-win.exe` as a
+download.
 
 ## If something does not work
 

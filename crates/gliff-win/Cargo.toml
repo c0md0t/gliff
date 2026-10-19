@@ -1,0 +1,37 @@
+[package]
+name = "gliff-win"
+description = "Portable gliff client (winit + softbuffer, CPU decode), built for Windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+gliff-proto.workspace = true
+gliff-transport.workspace = true
+gliff-sw.workspace = true
+gliff-audio = { workspace = true, features = ["player"] }
+winit = "0.30"
+softbuffer = "0.4"
+png.workspace = true
+arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
+
+[target.'cfg(windows)'.dependencies]
+# The version winit uses, so the build carries one copy.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

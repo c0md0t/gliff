@@ -40,8 +40,37 @@ jobs:
       - uses: ./.github/actions/setup
       - run: mbx test --workspace --locked
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/setup-nasm@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p gliff-win --locked
+      - run: cargo build -p gliff-win --release --locked
+      # The keyboard hook must see keys typed into our own window (winit's
+      # raw device input once stopped it), so Win and Alt+Tab are captured.
+      - name: Check keyboard capture
+        timeout-minutes: 2
+        run: |
+          target/release/gliff-win.exe --probe-keys
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          target/release/gliff-win.exe --probe-keys --fullscreen
+      - name: Check install
+        shell: pwsh
+        run: |
+          target/release/gliff-win.exe --install
+          if ($LASTEXITCODE) { throw "install failed" }
+          if (-not (Test-Path "$env:LOCALAPPDATA\Programs\gliff\gliff-win.exe")) { throw "exe not installed" }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\gliff.lnk")) { throw "no Start menu shortcut" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gliff-win
+          path: target/release/gliff-win.exe
+
   release:
-    needs: [fmt, clippy, test]
+    needs: [fmt, clippy, test, windows]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -62,8 +91,13 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: gliff-win
+
       - name: Publish the release
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "gliff ${{ steps.version.outputs.version }}" \
-            --generate-notes
+            --generate-notes \
+            gliff-win.exe
