@@ -65,6 +65,10 @@ struct Cli {
     /// Disable clipboard sharing in both directions.
     #[arg(long)]
     no_clipboard: bool,
+    /// Colour detail: `444` for sharp text (two streams to decode) or
+    /// `420` for half the decode work.
+    #[arg(long, default_value = "444", value_parser = ["444", "420"])]
+    chroma: String,
     /// Start full screen. Ctrl+Alt+Enter toggles it at any time.
     #[arg(long)]
     fullscreen: bool,
@@ -476,7 +480,10 @@ impl ApplicationHandler<Event> for App {
             self.cli.endpoint(),
             self.proxy.clone(),
             self.slot.clone(),
-            !self.cli.no_clipboard,
+            net::Options {
+                clipboard: !self.cli.no_clipboard,
+                full_chroma: self.cli.chroma == "444",
+            },
         ));
     }
 

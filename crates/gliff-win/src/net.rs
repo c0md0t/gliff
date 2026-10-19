@@ -111,14 +111,32 @@ pub fn spawn(
     endpoint: Endpoint,
     proxy: EventLoopProxy<Event>,
     slot: Slot,
-    clipboard: bool,
+    options: Options,
 ) -> UnboundedSender<ClientMsg> {
     let (tx, rx) = unbounded_channel();
     std::thread::Builder::new()
         .name("gliff-net".into())
-        .spawn(move || run(endpoint, proxy, slot, rx, clipboard))
+        .spawn(move || run(endpoint, proxy, slot, rx, options))
         .expect("spawn network thread");
     tx
+}
+
+/// Session choices from the command line.
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    pub clipboard: bool,
+    /// Ask for 4:4:4 colour (two 4:2:0 streams, recombined here) for
+    /// sharper text, at the cost of a second decode per frame.
+    pub full_chroma: bool,
+}
+
+/// What every session of one run shares.
+struct Ctx {
+    events: EventLoopProxy<Event>,
+    slot: Slot,
+    input: UnboundedReceiver<ClientMsg>,
+    clip: Option<ClipIo>,
+    full_chroma: bool,
 }
 
 /// The session's end of the clipboard thread.
@@ -205,10 +223,20 @@ fn run(
     endpoint: Endpoint,
     proxy: EventLoopProxy<Event>,
     slot: Slot,
-    mut input: UnboundedReceiver<ClientMsg>,
-    clipboard: bool,
+    input: UnboundedReceiver<ClientMsg>,
+    options: Options,
 ) {
-    let mut clip = if clipboard { ClipIo::start() } else { None };
+    let mut ctx = Ctx {
+        events: proxy.clone(),
+        slot,
+        input,
+        clip: if options.clipboard {
+            ClipIo::start()
+        } else {
+            None
+        },
+        full_chroma: options.full_chroma,
+    };
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -220,7 +248,6 @@ fn run(
         }
     };
     let local = tokio::task::LocalSet::new();
-    let events = proxy.clone();
     let result: anyhow::Result<()> = local.block_on(&rt, async move {
         // Once a session has connected, a dropped link is retried; until
         // then a failure (wrong host, refused login) is reported instead.
@@ -228,15 +255,7 @@ fn run(
         let mut attempt = 0u32;
         loop {
             let mut connected = false;
-            let ended = connect(
-                &endpoint,
-                events.clone(),
-                slot.clone(),
-                &mut input,
-                &mut clip,
-                &mut connected,
-            )
-            .await;
+            let ended = connect(&endpoint, &mut ctx, &mut connected).await;
             ever_connected |= connected;
             if connected {
                 attempt = 0;
@@ -249,13 +268,13 @@ fn run(
             };
             attempt += 1;
             let wait = retry_delay(attempt);
-            let _ = events.send_event(Event::Reconnecting {
+            let _ = ctx.events.send_event(Event::Reconnecting {
                 reason,
                 in_secs: wait.as_secs() as u32,
             });
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
-                _ = window_closed(&mut input) => return Ok(()),
+                _ = window_closed(&mut ctx.input) => return Ok(()),
             }
         }
     });
@@ -299,14 +318,7 @@ async fn window_closed(input: &mut UnboundedReceiver<ClientMsg>) {
 }
 
 /// Reach the server and run one session.
-async fn connect(
-    endpoint: &Endpoint,
-    events: EventLoopProxy<Event>,
-    slot: Slot,
-    input: &mut UnboundedReceiver<ClientMsg>,
-    clip: &mut Option<ClipIo>,
-    connected: &mut bool,
-) -> anyhow::Result<End> {
+async fn connect(endpoint: &Endpoint, ctx: &mut Ctx, connected: &mut bool) -> anyhow::Result<End> {
     match endpoint {
         Endpoint::Tcp(addr) => {
             let stream = tokio::net::TcpStream::connect(addr)
@@ -314,14 +326,14 @@ async fn connect(
                 .with_context(|| format!("connect to {addr}"))?;
             stream.set_nodelay(true)?;
             let (rd, wr) = tokio::io::split(stream);
-            session(rd, wr, events, slot, input, clip, connected).await
+            session(rd, wr, ctx, connected).await
         }
         Endpoint::Ssh(target) => {
             // Without ssh there is nothing to retry.
             let ssh = spawn_ssh(target).map_err(|e| fatal(format!("cannot start ssh: {e}")))?;
             // Keep the child alive for the session; dropping it kills ssh.
             let _child = ssh.child;
-            session(ssh.stdout, ssh.stdin, events, slot, input, clip, connected).await
+            session(ssh.stdout, ssh.stdin, ctx, connected).await
         }
     }
 }
@@ -339,24 +351,26 @@ fn new_decoder(chroma: ChromaMode, width: u32, height: u32) -> anyhow::Result<gl
     Ok(gliff_sw::Decoder::new(chroma != ChromaMode::Single420)?)
 }
 
-async fn session<R, W>(
-    rd: R,
-    wr: W,
-    events: EventLoopProxy<Event>,
-    slot: Slot,
-    input: &mut UnboundedReceiver<ClientMsg>,
-    clip: &mut Option<ClipIo>,
-    connected: &mut bool,
-) -> anyhow::Result<End>
+async fn session<R, W>(rd: R, wr: W, ctx: &mut Ctx, connected: &mut bool) -> anyhow::Result<End>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
+    let events = ctx.events.clone();
+    let slot = ctx.slot.clone();
+    let input = &mut ctx.input;
+    let clip = &mut ctx.clip;
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
-    // One 4:2:0 stream: the CPU tier decodes one stream, not two. No keymap:
-    // the server uses its own, which suits a client with no XKB text.
+    // 4:4:4 as two 4:2:0 streams when asked for, else one 4:2:0 stream to
+    // decode only once. No keymap: the server uses its own, which suits a
+    // client with no XKB text.
+    let chroma = if ctx.full_chroma {
+        vec![ChromaMode::Dual420, ChromaMode::Single420]
+    } else {
+        vec![ChromaMode::Single420]
+    };
     writer
         .write_msg(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
@@ -365,7 +379,7 @@ where
                 codecs: vec![Codec::H264],
                 max_width: MAX_STREAM.0,
                 max_height: MAX_STREAM.1,
-                chroma: vec![ChromaMode::Single420],
+                chroma,
                 features: features(),
             },
         })
@@ -685,14 +699,20 @@ where
         }
         if last_report.elapsed().as_secs_f32() >= 1.0 {
             let secs = last_report.elapsed().as_secs_f32();
+            let (fps, mbit) = (
+                frames_since as f32 / secs,
+                bytes_since as f32 * 8.0 / 1_000_000.0 / secs,
+            );
+            let decode_ms = if frames_since > 0 {
+                decode_ms_acc / frames_since as f32
+            } else {
+                0.0
+            };
+            tracing::debug!(fps, mbit, decode_ms, ?chroma, width, height, "stats");
             let _ = events.send_event(Event::Stats {
-                fps: frames_since as f32 / secs,
-                mbit: bytes_since as f32 * 8.0 / 1_000_000.0 / secs,
-                decode_ms: if frames_since > 0 {
-                    decode_ms_acc / frames_since as f32
-                } else {
-                    0.0
-                },
+                fps,
+                mbit,
+                decode_ms,
             });
             frames_since = 0;
             bytes_since = 0;
