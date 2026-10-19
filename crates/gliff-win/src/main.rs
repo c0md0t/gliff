@@ -87,6 +87,18 @@ impl Cli {
         }
         let mut t = SshTarget::new(self.host.clone().unwrap_or_default());
         t.server_bin = self.server_bin.clone();
+        // Notice a dead link (a laptop waking from sleep) within about 15 s,
+        // so the session can reconnect instead of hanging.
+        t.ssh_args = [
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "ConnectTimeout=15",
+        ]
+        .map(String::from)
+        .to_vec();
         t.server_args = match (&self.output, self.headless) {
             (Some(name), _) => vec!["--output".into(), name.clone()],
             (None, true) => vec!["--headless".into()],
@@ -130,6 +142,8 @@ struct App {
     /// The keyboard was handed back with the release hotkey; a click on the
     /// picture takes it again.
     released: bool,
+    /// A session has connected before, so the next one is a reconnection.
+    connected_before: bool,
     /// A key reached the window past the hook; noted once on the console.
     #[cfg(windows)]
     stray_key_noted: bool,
@@ -157,6 +171,7 @@ impl App {
             video: String::new(),
             exit_error: None,
             released: false,
+            connected_before: false,
             #[cfg(windows)]
             stray_key_noted: false,
             #[cfg(windows)]
@@ -481,7 +496,12 @@ impl ApplicationHandler<Event> for App {
                 self.headless = headless;
                 self.video = video;
                 if first {
-                    eprintln!("gliff: connected. {KEY_HELP}");
+                    if self.connected_before {
+                        eprintln!("gliff: reconnected");
+                    } else {
+                        eprintln!("gliff: connected. {KEY_HELP}");
+                        self.connected_before = true;
+                    }
                     self.set_title(&self.video);
                     if headless {
                         if let Some(gfx) = &self.gfx {
@@ -510,6 +530,15 @@ impl ApplicationHandler<Event> for App {
                 argb,
             } => self.set_cursor(event_loop, width, height, (hot_x, hot_y), &argb),
             Event::Key { keycode, pressed } => self.on_key(keycode, pressed, "the keyboard hook"),
+            Event::Reconnecting { reason, in_secs } => {
+                // The next session starts afresh: no keys held, and it
+                // must be told the window size again.
+                self.pressed.clear();
+                self.resize_sent = None;
+                self.video.clear();
+                eprintln!("gliff: connection lost ({reason}); reconnecting in {in_secs} s");
+                self.set_title(&format!("reconnecting… ({reason})"));
+            }
             Event::Error(e) => {
                 self.exit_error = Some(e);
                 event_loop.exit();

@@ -89,6 +89,11 @@ pub enum Event {
         keycode: u32,
         pressed: bool,
     },
+    /// The link dropped; the worker tries again in `in_secs`.
+    Reconnecting {
+        reason: String,
+        in_secs: u32,
+    },
     Error(String),
     Closed,
 }
@@ -217,20 +222,40 @@ fn run(
     let local = tokio::task::LocalSet::new();
     let events = proxy.clone();
     let result: anyhow::Result<()> = local.block_on(&rt, async move {
-        match endpoint {
-            Endpoint::Tcp(addr) => {
-                let stream = tokio::net::TcpStream::connect(&addr)
-                    .await
-                    .with_context(|| format!("connect to {addr}"))?;
-                stream.set_nodelay(true)?;
-                let (rd, wr) = tokio::io::split(stream);
-                session(rd, wr, events, slot, &mut input, &mut clip).await
+        // Once a session has connected, a dropped link is retried; until
+        // then a failure (wrong host, refused login) is reported instead.
+        let mut ever_connected = false;
+        let mut attempt = 0u32;
+        loop {
+            let mut connected = false;
+            let ended = connect(
+                &endpoint,
+                events.clone(),
+                slot.clone(),
+                &mut input,
+                &mut clip,
+                &mut connected,
+            )
+            .await;
+            ever_connected |= connected;
+            if connected {
+                attempt = 0;
             }
-            Endpoint::Ssh(target) => {
-                let ssh = spawn_ssh(&target).context("start ssh")?;
-                // Keep the child alive for the session; dropping it kills ssh.
-                let _child = ssh.child;
-                session(ssh.stdout, ssh.stdin, events, slot, &mut input, &mut clip).await
+            let reason = match ended {
+                Ok(End::WindowClosed) => return Ok(()),
+                Ok(End::ServerClosed) => "the server closed the connection".to_string(),
+                Err(e) if e.is::<Fatal>() || !ever_connected => return Err(e),
+                Err(e) => format!("{e:#}"),
+            };
+            attempt += 1;
+            let wait = retry_delay(attempt);
+            let _ = events.send_event(Event::Reconnecting {
+                reason,
+                in_secs: wait.as_secs() as u32,
+            });
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = window_closed(&mut input) => return Ok(()),
             }
         }
     });
@@ -238,6 +263,67 @@ fn run(
         Ok(()) => Event::Closed,
         Err(e) => Event::Error(format!("{e:#}")),
     });
+}
+
+/// How a session ended without an error.
+enum End {
+    WindowClosed,
+    ServerClosed,
+}
+
+/// An error retrying cannot cure, such as a protocol version mismatch.
+#[derive(Debug)]
+struct Fatal(String);
+
+impl std::fmt::Display for Fatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Fatal {}
+
+fn fatal(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Fatal(message.into()))
+}
+
+/// 1, 2, 4, 8, then 10 seconds between attempts.
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs((1u64 << attempt.saturating_sub(1).min(4)).min(10))
+}
+
+/// Resolves once the window has closed, discarding input meanwhile: keys
+/// typed while disconnected must not reach the next session.
+async fn window_closed(input: &mut UnboundedReceiver<ClientMsg>) {
+    while input.recv().await.is_some() {}
+}
+
+/// Reach the server and run one session.
+async fn connect(
+    endpoint: &Endpoint,
+    events: EventLoopProxy<Event>,
+    slot: Slot,
+    input: &mut UnboundedReceiver<ClientMsg>,
+    clip: &mut Option<ClipIo>,
+    connected: &mut bool,
+) -> anyhow::Result<End> {
+    match endpoint {
+        Endpoint::Tcp(addr) => {
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .with_context(|| format!("connect to {addr}"))?;
+            stream.set_nodelay(true)?;
+            let (rd, wr) = tokio::io::split(stream);
+            session(rd, wr, events, slot, input, clip, connected).await
+        }
+        Endpoint::Ssh(target) => {
+            // Without ssh there is nothing to retry.
+            let ssh = spawn_ssh(target).map_err(|e| fatal(format!("cannot start ssh: {e}")))?;
+            // Keep the child alive for the session; dropping it kills ssh.
+            let _child = ssh.child;
+            session(ssh.stdout, ssh.stdin, events, slot, input, clip, connected).await
+        }
+    }
 }
 
 fn tier_label(pipeline: Option<VideoPipeline>) -> String {
@@ -260,7 +346,8 @@ async fn session<R, W>(
     slot: Slot,
     input: &mut UnboundedReceiver<ClientMsg>,
     clip: &mut Option<ClipIo>,
-) -> anyhow::Result<()>
+    connected: &mut bool,
+) -> anyhow::Result<End>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
@@ -294,7 +381,7 @@ where
                 version, session, ..
             } => {
                 if version != PROTOCOL_VERSION {
-                    anyhow::bail!("{}", version_mismatch(PROTOCOL_VERSION, version));
+                    return Err(fatal(version_mismatch(PROTOCOL_VERSION, version)));
                 }
                 headless = session.headless;
                 got_ack = true;
@@ -320,7 +407,7 @@ where
                 )
             }
             ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
-                anyhow::bail!("incompatible server: {message}")
+                return Err(fatal(format!("incompatible server: {message}")))
             }
             ServerMsg::Error { code, message, .. } => {
                 anyhow::bail!("server error {code}: {message}")
@@ -329,6 +416,7 @@ where
         }
     };
     let mut decoder = new_decoder(chroma, width, height)?;
+    *connected = true;
     let _ = events.send_event(Event::Connected {
         video: tier_label(pipeline),
         headless,
@@ -401,7 +489,7 @@ where
                     continue;
                 }
                 // The window closed.
-                None => return Ok(()),
+                None => return Ok(End::WindowClosed),
             },
             content = next_local(clip) => {
                 tracing::debug!(mime = content.mime(), "offering our clipboard");
@@ -420,7 +508,7 @@ where
             }
             written = &mut writes => {
                 written.context("writer task")?.context("write to server")?;
-                return Ok(());
+                return Ok(End::ServerClosed);
             }
             _ = tokio::time::sleep_until(drain_at), if decoder.has_pending() => {
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
@@ -532,7 +620,7 @@ where
             }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::HelloAck { .. } => {}
             ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
-                anyhow::bail!("incompatible server: {message}")
+                return Err(fatal(format!("incompatible server: {message}")))
             }
             ServerMsg::Error { code, message, .. } => {
                 anyhow::bail!("server error {code}: {message}")
@@ -612,7 +700,7 @@ where
             last_report = std::time::Instant::now();
         }
     }
-    Ok(())
+    Ok(End::ServerClosed)
 }
 
 fn now_ms() -> u64 {
@@ -633,6 +721,12 @@ fn validate_stream_size(width: u32, height: u32) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_back_off_to_ten_seconds() {
+        let secs: Vec<u64> = (1..=7).map(|a| retry_delay(a).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 10, 10, 10]);
+    }
 
     #[test]
     fn rejects_invalid_stream_geometry() {
