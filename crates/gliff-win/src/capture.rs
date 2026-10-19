@@ -1,8 +1,8 @@
 //! Keyboard capture on Windows. A low-level keyboard hook sees every key
-//! before the shell does, so while our window is in front and capture is
-//! on, Win, Alt-Tab, Ctrl-Esc and the rest go to the remote instead of
-//! Windows. Only Ctrl-Alt-Del and Win-L stay with Windows: no hook can
-//! take them.
+//! before the shell does, so while our window has the keyboard focus and
+//! capture is on, Win, Alt-Tab, Ctrl-Esc and the rest go to the remote
+//! instead of Windows. Only Ctrl-Alt-Del and Win-L stay with Windows: no
+//! hook can take them.
 //!
 //! The hook runs on the thread that installed it, which is the event loop
 //! thread, while that thread pumps messages. It must return quickly or
@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetForegroundWindow, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK,
@@ -27,10 +27,14 @@ struct State {
     proxy: EventLoopProxy<Event>,
     /// Capture is on: not handed back with the release hotkey.
     active: bool,
+    /// Our window has the keyboard focus, as winit reports it.
+    focused: bool,
     /// Keys whose press the hook took, so it takes their release too, even
     /// after capture ends; a release Windows saw without its press is
     /// harmless, a press without its release would leave the key stuck.
     taken: HashSet<u32>,
+    /// The first key press has been reported on the console.
+    reported: bool,
 }
 
 thread_local! {
@@ -49,14 +53,18 @@ impl Drop for Hook {
 }
 
 /// Capture keys for `hwnd`, posting them to `proxy` as `Event::Key`. Call
-/// on the event loop thread.
-pub fn install(hwnd: HWND, proxy: EventLoopProxy<Event>) -> Option<Hook> {
+/// on the event loop thread. The error is the Windows error code.
+pub fn install(hwnd: HWND, proxy: EventLoopProxy<Event>) -> Result<Hook, u32> {
+    // SAFETY: GetForegroundWindow has no preconditions.
+    let focused = unsafe { GetForegroundWindow() } == hwnd;
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
             hwnd,
             proxy,
             active: true,
+            focused,
             taken: HashSet::new(),
+            reported: false,
         })
     });
     // SAFETY: a null name asks for this executable's module handle; the
@@ -70,18 +78,29 @@ pub fn install(hwnd: HWND, proxy: EventLoopProxy<Event>) -> Option<Hook> {
         )
     };
     if hook == 0 {
+        // SAFETY: GetLastError has no preconditions.
+        let error = unsafe { GetLastError() };
         STATE.with(|s| *s.borrow_mut() = None);
-        return None;
+        return Err(error);
     }
-    Some(Hook(hook))
+    Ok(Hook(hook))
 }
 
 /// Turn capture on or off. Keys already taken still have their releases
 /// taken.
 pub fn set_active(active: bool) {
+    with_state(|state| state.active = active);
+}
+
+/// Follow winit's focus events for the window.
+pub fn set_focused(focused: bool) {
+    with_state(|state| state.focused = focused);
+}
+
+fn with_state(f: impl FnOnce(&mut State)) {
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
-            state.active = active;
+            f(state);
         }
     });
 }
@@ -118,9 +137,16 @@ fn take(kb: &KBDLLHOOKSTRUCT) -> bool {
                 return false;
             }
         } else {
-            // SAFETY: GetForegroundWindow has no preconditions.
-            let front = unsafe { GetForegroundWindow() } == state.hwnd;
-            if !(state.active && front) {
+            if !state.reported {
+                state.reported = true;
+                // SAFETY: GetForegroundWindow has no preconditions.
+                let front = unsafe { GetForegroundWindow() } == state.hwnd;
+                eprintln!(
+                    "gliff: keyboard hook saw its first key (focused: {}, in front: {front}, capturing: {})",
+                    state.focused, state.active
+                );
+            }
+            if !(state.active && state.focused) {
                 return false;
             }
             state.taken.insert(id);

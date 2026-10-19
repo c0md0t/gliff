@@ -499,7 +499,13 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Focused(false) => self.release_keys(),
+            WindowEvent::Focused(focused) => {
+                #[cfg(windows)]
+                capture::set_focused(focused);
+                if !focused {
+                    self.release_keys();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.hooked() || event.repeat {
                     return;
@@ -546,20 +552,35 @@ impl ApplicationHandler<Event> for App {
 #[cfg(windows)]
 fn install_hook(window: &Window, proxy: EventLoopProxy<Event>) -> Option<capture::Hook> {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    // Printed rather than logged: whether shortcuts reach the remote is the
+    // first thing to check when they do not.
     let hwnd = match window.window_handle().map(|h| h.as_raw()) {
         Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
-        _ => return None,
+        other => {
+            eprintln!(
+                "gliff: no Win32 window handle ({other:?}); Win and Alt+Tab stay with Windows"
+            );
+            return None;
+        }
     };
-    let hook = capture::install(hwnd, proxy);
-    if hook.is_none() {
-        tracing::warn!("cannot install the keyboard hook; Win and Alt+Tab stay local");
+    match capture::install(hwnd, proxy) {
+        Ok(hook) => {
+            eprintln!("gliff: keyboard hook installed");
+            Some(hook)
+        }
+        Err(code) => {
+            eprintln!("gliff: cannot install the keyboard hook (error {code}); Win and Alt+Tab stay with Windows");
+            None
+        }
     }
-    hook
 }
 
 fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .init();
     let cli = Cli::parse();
     let event_loop = match EventLoop::<Event>::with_user_event().build() {
