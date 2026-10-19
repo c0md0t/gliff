@@ -419,6 +419,12 @@ impl ApplicationHandler<Event> for App {
             .with_title(format!("{APP_NAME} — {}", self.cli.machine()))
             .with_inner_size(LogicalSize::new(1600.0, 900.0))
             .with_fullscreen(self.cli.fullscreen.then_some(Fullscreen::Borderless(None)));
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            let drag = !std::env::var("GLIFF_HOOK").is_ok_and(|v| v == "nodrag" || v == "neither");
+            attrs.with_drag_and_drop(drag)
+        };
         let gfx = event_loop
             .create_window(attrs)
             .map_err(anyhow::Error::from)
@@ -666,6 +672,9 @@ fn main() -> std::process::ExitCode {
     #[cfg(windows)]
     match std::env::var("GLIFF_HOOK").as_deref() {
         Ok("early") => app.hook = install_hook(event_loop.create_proxy()),
+        Ok("nodevice" | "neither") => {
+            event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never)
+        }
         Ok("noconsole") => {
             // SAFETY: FreeConsole has no preconditions.
             let freed = unsafe { windows_sys::Win32::System::Console::FreeConsole() };
