@@ -55,6 +55,7 @@ jobs:
         timeout-minutes: 2
         run: |
           target/release/gliff-win.exe --probe-keys
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           target/release/gliff-win.exe --probe-keys --fullscreen
       - name: Check install
         shell: pwsh
