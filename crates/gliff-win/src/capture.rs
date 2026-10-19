@@ -1,72 +1,93 @@
 //! Keyboard capture on Windows. A low-level keyboard hook sees every key
-//! before the shell does, so while our window has the keyboard focus and
-//! capture is on, Win, Alt-Tab, Ctrl-Esc and the rest go to the remote
-//! instead of Windows. Only Ctrl-Alt-Del and Win-L stay with Windows: no
-//! hook can take them.
+//! before the shell does, so while our window is in front and capture is
+//! on, Win, Alt-Tab, Ctrl-Esc and the rest go to the remote instead of
+//! Windows. Only Ctrl-Alt-Del and Win-L stay with Windows: no hook can
+//! take them.
 //!
-//! The hook runs on the thread that installed it, which is the event loop
-//! thread, while that thread pumps messages. It must return quickly or
-//! Windows removes it, so it only posts the key to the event loop.
+//! The hook gets its own thread and message loop. Windows waits only a
+//! short time for a low-level hook before passing the key on (and drops a
+//! hook that keeps missing it), so it must not share a thread with
+//! drawing. "In front" is asked of Windows on every key: the foreground
+//! window belongs to this process, whose only window is ours (the console
+//! belongs to the terminal).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, WH_KEYBOARD_LL,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+    PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MSG, PM_NOREMOVE,
+    WH_KEYBOARD_LL, WM_QUIT, WM_USER,
 };
 use winit::event_loop::EventLoopProxy;
 
 use crate::keys;
 use crate::net::Event;
 
-struct State {
-    hwnd: HWND,
-    proxy: EventLoopProxy<Event>,
-    /// Capture is on: not handed back with the release hotkey.
-    active: bool,
-    /// Our window has the keyboard focus, as winit reports it.
-    focused: bool,
+/// Capture is on: not handed back with the release hotkey.
+static ACTIVE: AtomicBool = AtomicBool::new(true);
+static PROXY: OnceLock<EventLoopProxy<Event>> = OnceLock::new();
+
+/// Key presses reported on the console, for diagnosing capture.
+const REPORT_PRESSES: u32 = 3;
+
+thread_local! {
     /// Keys whose press the hook took, so it takes their release too, even
     /// after capture ends; a release Windows saw without its press is
     /// harmless, a press without its release would leave the key stuck.
-    taken: HashSet<u32>,
-    /// The first key press has been reported on the console.
-    reported: bool,
+    /// Only the hook thread touches it.
+    static TAKEN: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+    static REPORTED: Cell<u32> = const { Cell::new(0) };
 }
 
-thread_local! {
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+/// The hook thread; dropping it removes the hook.
+pub struct Hook {
+    thread_id: u32,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
-
-/// The installed hook; dropping it removes the hook.
-pub struct Hook(HHOOK);
 
 impl Drop for Hook {
     fn drop(&mut self) {
-        // SAFETY: `self.0` is the hook `install` set, removed only here.
-        unsafe { UnhookWindowsHookEx(self.0) };
-        STATE.with(|s| *s.borrow_mut() = None);
+        // SAFETY: posting WM_QUIT to a thread id has no memory effects; the
+        // thread's loop ends and it removes its hook.
+        unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
-/// Capture keys for `hwnd`, posting them to `proxy` as `Event::Key`. Call
-/// on the event loop thread. The error is the Windows error code.
-pub fn install(hwnd: HWND, proxy: EventLoopProxy<Event>) -> Result<Hook, u32> {
-    // SAFETY: GetForegroundWindow has no preconditions.
-    let focused = unsafe { GetForegroundWindow() } == hwnd;
-    STATE.with(|s| {
-        *s.borrow_mut() = Some(State {
-            hwnd,
-            proxy,
-            active: true,
-            focused,
-            taken: HashSet::new(),
-            reported: false,
-        })
-    });
+/// Capture keys on a thread of their own, posting them to `proxy` as
+/// `Event::Key`. The error is the Windows error code.
+pub fn install(proxy: EventLoopProxy<Event>) -> Result<Hook, u32> {
+    let _ = PROXY.set(proxy);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("gliff-keys".into())
+        .spawn(move || hook_thread(tx))
+        .map_err(|_| 0u32)?;
+    match rx.recv() {
+        Ok(Ok(thread_id)) => Ok(Hook {
+            thread_id,
+            thread: Some(thread),
+        }),
+        Ok(Err(code)) => Err(code),
+        Err(_) => Err(0),
+    }
+}
+
+fn hook_thread(ready: std::sync::mpsc::Sender<Result<u32, u32>>) {
+    // SAFETY: an all-zero MSG is a valid value for these out-parameters.
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    // SAFETY: PeekMessage with a valid MSG creates this thread's message
+    // queue, so the WM_QUIT posted on drop cannot be lost.
+    unsafe { PeekMessageW(&mut msg, 0, WM_USER, WM_USER, PM_NOREMOVE) };
     // SAFETY: a null name asks for this executable's module handle; the
     // hook procedure lives in it and matches the HOOKPROC signature.
     let hook = unsafe {
@@ -79,30 +100,42 @@ pub fn install(hwnd: HWND, proxy: EventLoopProxy<Event>) -> Result<Hook, u32> {
     };
     if hook == 0 {
         // SAFETY: GetLastError has no preconditions.
-        let error = unsafe { GetLastError() };
-        STATE.with(|s| *s.borrow_mut() = None);
-        return Err(error);
+        let _ = ready.send(Err(unsafe { GetLastError() }));
+        return;
     }
-    Ok(Hook(hook))
+    // SAFETY: GetCurrentThreadId has no preconditions.
+    let _ = ready.send(Ok(unsafe { GetCurrentThreadId() }));
+    // The hook procedure runs inside this loop's GetMessage.
+    // SAFETY: `msg` is a valid MSG; a null window takes this thread's
+    // messages, and each is translated and dispatched as received.
+    unsafe {
+        while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        UnhookWindowsHookEx(hook);
+    }
 }
 
 /// Turn capture on or off. Keys already taken still have their releases
 /// taken.
 pub fn set_active(active: bool) {
-    with_state(|state| state.active = active);
+    ACTIVE.store(active, Ordering::Relaxed);
 }
 
-/// Follow winit's focus events for the window.
-pub fn set_focused(focused: bool) {
-    with_state(|state| state.focused = focused);
-}
-
-fn with_state(f: impl FnOnce(&mut State)) {
-    STATE.with(|s| {
-        if let Some(state) = s.borrow_mut().as_mut() {
-            f(state);
+/// The foreground window belongs to this process.
+fn ours_in_front() -> bool {
+    // SAFETY: these calls have no preconditions; `pid` is a valid out
+    // pointer for the duration of the call.
+    unsafe {
+        let front = GetForegroundWindow();
+        if front == 0 {
+            return false;
         }
-    });
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(front, &mut pid);
+        pid == GetCurrentProcessId()
+    }
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -130,40 +163,36 @@ fn take(kb: &KBDLLHOOKSTRUCT) -> bool {
     let up = kb.flags & LLKHF_UP != 0;
     // Identifies the physical key across its press and release.
     let id = kb.vkCode << 16 | u32::from(extended) << 8 | (kb.scanCode & 0xFF);
-    STATE.with(|s| {
-        let Ok(mut guard) = s.try_borrow_mut() else {
+    if up {
+        if !TAKEN.with(|t| t.borrow_mut().remove(&id)) {
             return false;
-        };
-        let Some(state) = guard.as_mut() else {
+        }
+    } else {
+        let front = ours_in_front();
+        let active = ACTIVE.load(Ordering::Relaxed);
+        let n = REPORTED.get();
+        if n < REPORT_PRESSES {
+            REPORTED.set(n + 1);
+            eprintln!(
+                "gliff: key {:#x} pressed (gliff in front: {front}, capturing: {active})",
+                kb.vkCode
+            );
+        }
+        if !(front && active) {
             return false;
-        };
-        if up {
-            if !state.taken.remove(&id) {
-                return false;
-            }
-        } else {
-            if !state.reported {
-                state.reported = true;
-                // SAFETY: GetForegroundWindow has no preconditions.
-                let front = unsafe { GetForegroundWindow() } == state.hwnd;
-                eprintln!(
-                    "gliff: keyboard hook saw its first key (focused: {}, in front: {front}, capturing: {})",
-                    state.focused, state.active
-                );
-            }
-            if !(state.active && state.focused) {
-                return false;
-            }
-            state.taken.insert(id);
         }
-        // While captured, keys with no evdev code are kept from Windows
-        // too, and just not forwarded.
-        if let Some(keycode) = keys::evdev_from_set1(kb.scanCode, extended, kb.vkCode) {
-            let _ = state.proxy.send_event(Event::Key {
-                keycode,
-                pressed: !up,
-            });
-        }
-        true
-    })
+        TAKEN.with(|t| t.borrow_mut().insert(id));
+    }
+    // While captured, keys with no evdev code are kept from Windows too,
+    // and just not forwarded.
+    if let (Some(keycode), Some(proxy)) = (
+        keys::evdev_from_set1(kb.scanCode, extended, kb.vkCode),
+        PROXY.get(),
+    ) {
+        let _ = proxy.send_event(Event::Key {
+            keycode,
+            pressed: !up,
+        });
+    }
+    true
 }

@@ -429,8 +429,7 @@ impl ApplicationHandler<Event> for App {
                     // A window opened from a terminal can be left without
                     // the keyboard focus, which stays with the terminal.
                     gfx.window.focus_window();
-                    self.hook = install_hook(&gfx.window, self.proxy.clone());
-                    capture::set_focused(gfx.window.has_focus());
+                    self.hook = install_hook(self.proxy.clone());
                 }
                 self.gfx = Some(gfx);
             }
@@ -517,13 +516,7 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Focused(focused) => {
-                #[cfg(windows)]
-                capture::set_focused(focused);
-                if !focused {
-                    self.release_keys();
-                }
-            }
+            WindowEvent::Focused(false) => self.release_keys(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.hooked() {
                     // The hook should have taken this key. Windows drops a
@@ -578,23 +571,13 @@ impl ApplicationHandler<Event> for App {
     }
 }
 
-/// Install the keyboard hook for `window`, or `None` to fall back to
-/// winit's key events, which Windows filters (no Win key, no Alt+Tab).
+/// Install the keyboard hook, or `None` to fall back to winit's key
+/// events, which Windows filters (no Win key, no Alt+Tab). Printed rather
+/// than logged: whether shortcuts reach the remote is the first thing to
+/// check when they do not.
 #[cfg(windows)]
-fn install_hook(window: &Window, proxy: EventLoopProxy<Event>) -> Option<capture::Hook> {
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    // Printed rather than logged: whether shortcuts reach the remote is the
-    // first thing to check when they do not.
-    let hwnd = match window.window_handle().map(|h| h.as_raw()) {
-        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
-        other => {
-            eprintln!(
-                "gliff: no Win32 window handle ({other:?}); Win and Alt+Tab stay with Windows"
-            );
-            return None;
-        }
-    };
-    match capture::install(hwnd, proxy) {
+fn install_hook(proxy: EventLoopProxy<Event>) -> Option<capture::Hook> {
+    match capture::install(proxy) {
         Ok(hook) => {
             eprintln!("gliff: keyboard hook installed");
             Some(hook)
