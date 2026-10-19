@@ -39,7 +39,7 @@ static OUR_HWND: AtomicIsize = AtomicIsize::new(0);
 static PROXY: OnceLock<EventLoopProxy<Event>> = OnceLock::new();
 
 /// Key presses reported on the console, for diagnosing capture.
-const REPORT_PRESSES: u32 = 8;
+const REPORT_PRESSES: u32 = 3;
 
 thread_local! {
     /// Keys whose press the hook took, so it takes their release too, even
@@ -50,41 +50,21 @@ thread_local! {
     static REPORTED: Cell<u32> = const { Cell::new(0) };
 }
 
-/// The installed hook; dropping it removes the hook.
-pub enum Hook {
-    /// On a thread of its own.
-    Thread {
-        thread_id: u32,
-        thread: Option<std::thread::JoinHandle<()>>,
-    },
-    /// On the thread that installed it, whose message loop runs it.
-    Here(HHOOK),
+/// The hook thread; dropping it removes the hook.
+pub struct Hook {
+    thread_id: u32,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Hook {
     fn drop(&mut self) {
-        match self {
-            Hook::Thread { thread_id, thread } => {
-                // SAFETY: posting WM_QUIT to a thread id has no memory
-                // effects; the thread's loop ends and it removes its hook.
-                unsafe { PostThreadMessageW(*thread_id, WM_QUIT, 0, 0) };
-                if let Some(thread) = thread.take() {
-                    let _ = thread.join();
-                }
-            }
-            // SAFETY: the hook `install_here` set, removed only here.
-            Hook::Here(hook) => unsafe {
-                UnhookWindowsHookEx(*hook);
-            },
+        // SAFETY: posting WM_QUIT to a thread id has no memory effects; the
+        // thread's loop ends and it removes its hook.
+        unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
-}
-
-/// Capture keys with a hook on the calling thread, which must pump
-/// messages (the event loop thread does). For comparison with `install`.
-pub fn install_here(proxy: EventLoopProxy<Event>) -> Result<Hook, u32> {
-    let _ = PROXY.set(proxy);
-    set_hook().map(Hook::Here)
 }
 
 fn set_hook() -> Result<HHOOK, u32> {
@@ -109,18 +89,13 @@ fn set_hook() -> Result<HHOOK, u32> {
 /// `Event::Key`. The error is the Windows error code.
 pub fn install(proxy: EventLoopProxy<Event>) -> Result<Hook, u32> {
     let _ = PROXY.set(proxy);
-    spawn_hook_thread()
-}
-
-/// The hook on its own thread, with nowhere to send keys yet.
-pub fn spawn_hook_thread() -> Result<Hook, u32> {
     let (tx, rx) = std::sync::mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("gliff-keys".into())
         .spawn(move || hook_thread(tx))
         .map_err(|_| 0u32)?;
     match rx.recv() {
-        Ok(Ok(thread_id)) => Ok(Hook::Thread {
+        Ok(Ok(thread_id)) => Ok(Hook {
             thread_id,
             thread: Some(thread),
         }),
@@ -251,12 +226,7 @@ pub fn our_hwnd() -> isize {
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let n = CALLS.fetch_add(1, Ordering::Relaxed);
-    if n < 20 && code == HC_ACTION as i32 {
-        // SAFETY: as below.
-        let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        eprintln!("hook: call {n} vk {:#x} flags {:#x}", kb.vkCode, kb.flags);
-    }
+    CALLS.fetch_add(1, Ordering::Relaxed);
     if code == HC_ACTION as i32 {
         // SAFETY: for HC_ACTION, `lparam` points at the KBDLLHOOKSTRUCT for
         // this event, valid for the duration of the call.

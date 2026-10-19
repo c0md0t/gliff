@@ -126,8 +126,7 @@ struct App {
     /// The keyboard was handed back with the release hotkey; a click on the
     /// picture takes it again.
     released: bool,
-    /// One-shot console notes for diagnosing keys that do not arrive.
-    first_key_noted: bool,
+    /// A key reached the window past the hook; noted once on the console.
     #[cfg(windows)]
     stray_key_noted: bool,
     /// The Windows keyboard hook, which takes keys (Win and Alt+Tab
@@ -154,7 +153,6 @@ impl App {
             video: String::new(),
             exit_error: None,
             released: false,
-            first_key_noted: false,
             #[cfg(windows)]
             stray_key_noted: false,
             #[cfg(windows)]
@@ -172,13 +170,6 @@ impl App {
     fn on_key(&mut self, keycode: u32, pressed: bool, source: &str) {
         if self.cli.probe_keys {
             eprintln!("probe: key evdev {keycode} pressed {pressed} from {source}");
-        }
-        if !self.first_key_noted {
-            self.first_key_noted = true;
-            eprintln!(
-                "gliff: first key reached the window from {source} (evdev {keycode}, released: {})",
-                self.released
-            );
         }
         if self.released {
             return;
@@ -419,12 +410,6 @@ impl ApplicationHandler<Event> for App {
             .with_title(format!("{APP_NAME} — {}", self.cli.machine()))
             .with_inner_size(LogicalSize::new(1600.0, 900.0))
             .with_fullscreen(self.cli.fullscreen.then_some(Fullscreen::Borderless(None)));
-        #[cfg(windows)]
-        let attrs = {
-            use winit::platform::windows::WindowAttributesExtWindows;
-            let drag = !std::env::var("GLIFF_HOOK").is_ok_and(|v| v == "nodrag" || v == "neither");
-            attrs.with_drag_and_drop(drag)
-        };
         let gfx = event_loop
             .create_window(attrs)
             .map_err(anyhow::Error::from)
@@ -443,9 +428,7 @@ impl ApplicationHandler<Event> for App {
                     // A window opened from a terminal can be left without
                     // the keyboard focus, which stays with the terminal.
                     gfx.window.focus_window();
-                    if self.hook.is_none() {
-                        self.hook = install_hook(self.proxy.clone());
-                    }
+                    self.hook = install_hook(self.proxy.clone());
                     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
                     if let Ok(RawWindowHandle::Win32(w)) =
                         gfx.window.window_handle().map(|h| h.as_raw())
@@ -546,10 +529,7 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Focused(focused) => {
                 #[cfg(windows)]
-                {
-                    eprintln!("gliff: window focused: {focused}");
-                    capture::set_focused(focused);
-                }
+                capture::set_focused(focused);
                 if !focused {
                     self.release_keys();
                 }
@@ -625,15 +605,7 @@ impl ApplicationHandler<Event> for App {
 /// check when they do not.
 #[cfg(windows)]
 fn install_hook(proxy: EventLoopProxy<Event>) -> Option<capture::Hook> {
-    // GLIFF_HOOK=main puts the hook on the event loop thread, to compare
-    // with its own thread when testing capture.
-    let here = std::env::var("GLIFF_HOOK").is_ok_and(|v| v == "main");
-    let hook = if here {
-        capture::install_here(proxy)
-    } else {
-        capture::install(proxy)
-    };
-    match hook {
+    match capture::install(proxy) {
         Ok(hook) => {
             eprintln!("gliff: keyboard hook installed");
             Some(hook)
@@ -653,11 +625,6 @@ fn main() -> std::process::ExitCode {
         )
         .init();
     let cli = Cli::parse();
-    #[cfg(windows)]
-    if cli.probe_keys && std::env::var("GLIFF_HOOK").is_ok_and(|v| v == "plain") {
-        probe::plain();
-        return std::process::ExitCode::SUCCESS;
-    }
     let event_loop = match EventLoop::<Event>::with_user_event().build() {
         Ok(l) => l,
         Err(e) => {
@@ -666,22 +633,12 @@ fn main() -> std::process::ExitCode {
         }
     };
     let mut app = App::new(cli, event_loop.create_proxy());
-    // GLIFF_HOOK=early installs the hook before any window exists, and
-    // GLIFF_HOOK=noconsole detaches from the console first: both for
-    // testing capture.
+    // winit registers for raw keyboard input to report device events, and
+    // while it does, Windows skips low-level keyboard hooks for our own
+    // window, so the capture hook never sees a key. Gliff uses no device
+    // events. `--probe-keys` in CI guards this.
     #[cfg(windows)]
-    match std::env::var("GLIFF_HOOK").as_deref() {
-        Ok("early") => app.hook = install_hook(event_loop.create_proxy()),
-        Ok("nodevice" | "neither") => {
-            event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never)
-        }
-        Ok("noconsole") => {
-            // SAFETY: FreeConsole has no preconditions.
-            let freed = unsafe { windows_sys::Win32::System::Console::FreeConsole() };
-            eprintln!("gliff: detached from the console: {}", freed != 0);
-        }
-        _ => {}
-    }
+    event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("gliff: {e}");
         return std::process::ExitCode::FAILURE;
