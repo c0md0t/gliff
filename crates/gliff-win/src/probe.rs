@@ -21,6 +21,17 @@ const KEYS: &[(u16, u16)] = &[(0x41, 0x1E), (0x42, 0x30)];
 /// the event loop.
 pub fn start(proxy: EventLoopProxy<Event>) {
     std::thread::spawn(move || {
+        // What a real session runs beside the window: the clipboard thread
+        // and an audio device, in case either upsets the hook.
+        let (local_tx, _local_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _clipboard = crate::clip::spawn(local_tx);
+        let _audio = match gliff_audio::Player::open() {
+            Ok(player) => Some(player),
+            Err(e) => {
+                eprintln!("probe: no audio device ({e:#})");
+                None
+            }
+        };
         std::thread::sleep(Duration::from_millis(1500));
         for &(vk, scan) in KEYS {
             for up in [false, true] {

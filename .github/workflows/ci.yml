@@ -53,7 +53,9 @@ jobs:
       # raw device input once stopped it), so Win and Alt+Tab are captured.
       - name: Check keyboard capture
         timeout-minutes: 2
-        run: target/release/gliff-win.exe --probe-keys
+        run: |
+          target/release/gliff-win.exe --probe-keys
+          target/release/gliff-win.exe --probe-keys --fullscreen
       - name: Check install
         shell: pwsh
         run: |
