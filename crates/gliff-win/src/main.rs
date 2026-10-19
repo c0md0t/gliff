@@ -12,6 +12,7 @@ mod keys;
 mod net;
 #[cfg(windows)]
 mod probe;
+mod setup;
 mod view;
 
 use std::collections::HashSet;
@@ -47,8 +48,13 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(200);
 )]
 struct Cli {
     /// `user@host` (or an ssh config alias) to ssh to and spawn gliff-server.
-    #[arg(required_unless_present_any = ["connect", "probe_keys"])]
+    /// Without it, the machine connected to last time.
     host: Option<String>,
+    /// Install for this user: copy gliff-win to
+    /// %LOCALAPPDATA%\Programs\gliff, add it to PATH, and add a Start menu
+    /// shortcut (Windows only).
+    #[arg(long, conflicts_with_all = ["host", "connect"])]
+    install: bool,
     /// Dev: connect directly to a `gliff-server --listen` address.
     #[arg(long, conflicts_with = "host")]
     connect: Option<String>,
@@ -508,6 +514,9 @@ impl ApplicationHandler<Event> for App {
                     } else {
                         eprintln!("gliff: connected. {KEY_HELP}");
                         self.connected_before = true;
+                        if let Some(host) = &self.cli.host {
+                            setup::remember_host(host);
+                        }
                     }
                     self.set_title(&self.video);
                     if headless {
@@ -590,8 +599,8 @@ impl ApplicationHandler<Event> for App {
                 #[cfg(windows)]
                 if self.hooked() && !self.released && !self.stray_key_noted {
                     self.stray_key_noted = true;
-                    eprintln!(
-                        "gliff: a key reached the window instead of the keyboard hook ({:?} {:?}); sending it on",
+                    tracing::debug!(
+                        "a key reached the window instead of the keyboard hook ({:?} {:?}); sending it on",
                         event.physical_key, event.state
                     );
                 }
@@ -648,7 +657,7 @@ impl ApplicationHandler<Event> for App {
 fn install_hook(proxy: EventLoopProxy<Event>) -> Option<capture::Hook> {
     match capture::install(proxy) {
         Ok(hook) => {
-            eprintln!("gliff: keyboard hook installed");
+            tracing::debug!("keyboard hook installed");
             Some(hook)
         }
         Err(code) => {
@@ -665,7 +674,32 @@ fn main() -> std::process::ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if cli.install {
+        #[cfg(windows)]
+        return match setup::install() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("gliff: install failed: {e:#}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+        #[cfg(not(windows))]
+        {
+            eprintln!("gliff: --install is for Windows");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    if cli.host.is_none() && cli.connect.is_none() && !cli.probe_keys {
+        cli.host = setup::last_host().or_else(setup::ask_host);
+        match &cli.host {
+            Some(host) => eprintln!("gliff: connecting to {host}"),
+            None => {
+                eprintln!("gliff: no machine to connect to; run gliff-win user@host");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    }
     let event_loop = match EventLoop::<Event>::with_user_event().build() {
         Ok(l) => l,
         Err(e) => {

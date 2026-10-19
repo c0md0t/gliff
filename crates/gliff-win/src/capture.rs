@@ -167,8 +167,8 @@ fn report_press(vk: u32, injected: bool, focused: bool, front: bool, active: boo
     };
     // SAFETY: GetCurrentProcessId has no preconditions.
     let our_pid = unsafe { GetCurrentProcessId() };
-    eprintln!(
-        "gliff: key {vk:#x} pressed{}: capture {} (winit focused {focused}, capturing {active}); \
+    tracing::debug!(
+        "key {vk:#x} pressed{}: capture {} (winit focused {focused}, capturing {active}); \
          front window {fg:#x} pid {pid} class {class:?} active {:#x} focus {:#x}; \
          ours {:#x} pid {our_pid}",
         if injected { " (injected)" } else { "" },
