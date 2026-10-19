@@ -56,7 +56,7 @@ jobs:
         timeout-minutes: 4
         shell: cmd
         run: |
-          for %%v in (thread main early noconsole) do (
+          for %%v in (thread main) do (
             echo === GLIFF_HOOK=%%v
             set GLIFF_HOOK=%%v
             target\release\gliff-win.exe --probe-keys 2>&1

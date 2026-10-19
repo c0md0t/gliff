@@ -13,7 +13,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
@@ -234,7 +234,24 @@ fn ours_in_front() -> bool {
     }
 }
 
+/// Calls of the hook procedure, for `--probe-keys`.
+static CALLS: AtomicU32 = AtomicU32::new(0);
+
+pub fn calls() -> u32 {
+    CALLS.load(Ordering::Relaxed)
+}
+
+pub fn our_hwnd() -> isize {
+    OUR_HWND.load(Ordering::Relaxed)
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if n < 20 && code == HC_ACTION as i32 {
+        // SAFETY: as below.
+        let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+        eprintln!("hook: call {n} vk {:#x} flags {:#x}", kb.vkCode, kb.flags);
+    }
     if code == HC_ACTION as i32 {
         // SAFETY: for HC_ACTION, `lparam` points at the KBDLLHOOKSTRUCT for
         // this event, valid for the duration of the call.

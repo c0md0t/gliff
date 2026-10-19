@@ -8,8 +8,10 @@ use std::time::Duration;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MINIMIZE};
 use winit::event_loop::EventLoopProxy;
 
+use crate::capture;
 use crate::net::Event;
 
 /// Virtual key and set-1 scancode of each key the probe types.
@@ -30,7 +32,25 @@ pub fn start(proxy: EventLoopProxy<Event>) {
                 std::thread::sleep(Duration::from_millis(150));
             }
         }
-        std::thread::sleep(Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_millis(500));
+        eprintln!(
+            "probe: hook calls with our window active: {}",
+            capture::calls()
+        );
+        // Control: with our window minimised, someone else is in front.
+        // SAFETY: ShowWindow on our own window handle; the event loop
+        // thread handles the resulting messages.
+        unsafe { ShowWindow(capture::our_hwnd(), SW_MINIMIZE) };
+        std::thread::sleep(Duration::from_millis(500));
+        let before = capture::calls();
+        eprintln!("probe: sending vk 0x43 with our window minimised");
+        send(0x43, 0x2E, false);
+        send(0x43, 0x2E, true);
+        std::thread::sleep(Duration::from_millis(500));
+        eprintln!(
+            "probe: hook calls for C with our window minimised: {}",
+            capture::calls() - before
+        );
         eprintln!("probe: done");
         let _ = proxy.send_event(Event::Closed);
     });
