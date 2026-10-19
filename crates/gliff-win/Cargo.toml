@@ -21,3 +21,11 @@ gliff-transport.workspace = true
 gliff-sw.workspace = true
 winit = "0.30"
 softbuffer = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# The version winit uses, so the build carries one copy.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }

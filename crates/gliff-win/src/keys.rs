@@ -187,9 +187,148 @@ pub fn evdev_button(button: MouseButton) -> u32 {
     }
 }
 
+pub const KEY_ESC: u32 = 1;
+pub const KEY_ENTER: u32 = 28;
+pub const KEY_LEFTCTRL: u32 = 29;
+pub const KEY_LEFTSHIFT: u32 = 42;
+pub const KEY_RIGHTSHIFT: u32 = 54;
+pub const KEY_LEFTALT: u32 = 56;
+pub const KEY_RIGHTCTRL: u32 = 97;
+pub const KEY_RIGHTALT: u32 = 100;
+
+#[cfg_attr(not(windows), allow(dead_code))]
+const VK_PAUSE: u32 = 0x13;
+#[cfg_attr(not(windows), allow(dead_code))]
+const VK_NUMLOCK: u32 = 0x90;
+
+/// The evdev code for a Windows set-1 scancode, as a low-level keyboard
+/// hook reports it: `scan`, whether the `0xE0` prefix was set, and the
+/// virtual key. Pause and Num Lock share scancode 0x45 and are told apart
+/// by the virtual key. `None` for codes with no key, such as the fake
+/// shifts Windows wraps around some extended keys.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn evdev_from_set1(scan: u32, extended: bool, vk: u32) -> Option<u32> {
+    match vk {
+        VK_PAUSE => return Some(119),
+        VK_NUMLOCK => return Some(69),
+        _ => {}
+    }
+    if extended {
+        return Some(match scan {
+            0x10 => 165, // KEY_PREVIOUSSONG
+            0x19 => 163, // KEY_NEXTSONG
+            0x1C => 96,  // KEY_KPENTER
+            0x1D => KEY_RIGHTCTRL,
+            0x20 => 113, // KEY_MUTE
+            0x21 => 140, // KEY_CALC
+            0x22 => 164, // KEY_PLAYPAUSE
+            0x24 => 166, // KEY_STOPCD
+            0x2E => 114, // KEY_VOLUMEDOWN
+            0x30 => 115, // KEY_VOLUMEUP
+            0x32 => 172, // KEY_HOMEPAGE
+            0x35 => 98,  // KEY_KPSLASH
+            // Right Shift sometimes arrives flagged extended.
+            0x36 => KEY_RIGHTSHIFT,
+            0x37 => 99, // KEY_SYSRQ (Print Screen)
+            0x38 => KEY_RIGHTALT,
+            0x47 => 102, // KEY_HOME
+            0x48 => 103, // KEY_UP
+            0x49 => 104, // KEY_PAGEUP
+            0x4B => 105, // KEY_LEFT
+            0x4D => 106, // KEY_RIGHT
+            0x4F => 107, // KEY_END
+            0x50 => 108, // KEY_DOWN
+            0x51 => 109, // KEY_PAGEDOWN
+            0x52 => 110, // KEY_INSERT
+            0x53 => 111, // KEY_DELETE
+            0x5B => 125, // KEY_LEFTMETA
+            0x5C => 126, // KEY_RIGHTMETA
+            0x5D => 127, // KEY_COMPOSE (Menu)
+            0x5E => 116, // KEY_POWER
+            0x5F => 142, // KEY_SLEEP
+            0x63 => 143, // KEY_WAKEUP
+            0x65 => 217, // KEY_SEARCH
+            0x66 => 156, // KEY_BOOKMARKS
+            0x67 => 173, // KEY_REFRESH
+            0x68 => 128, // KEY_STOP
+            0x69 => 159, // KEY_FORWARD
+            0x6A => 158, // KEY_BACK
+            0x6B => 157, // KEY_COMPUTER
+            0x6C => 155, // KEY_MAIL
+            0x6D => 226, // KEY_MEDIA
+            _ => return None,
+        });
+    }
+    Some(match scan {
+        // Escape through keypad '.' share their numbers with evdev.
+        0x01..=0x53 => scan,
+        0x54 => 99,                       // Alt+Print Screen
+        0x56 => 86,                       // KEY_102ND
+        0x57 => 87,                       // KEY_F11
+        0x58 => 88,                       // KEY_F12
+        0x59 => 117,                      // KEY_KPEQUAL
+        0x64..=0x6E => scan - 0x64 + 183, // KEY_F13..KEY_F23
+        0x70 => 93,                       // KEY_KATAKANAHIRAGANA
+        0x73 => 89,                       // KEY_RO
+        0x76 => 194,                      // KEY_F24
+        0x79 => 92,                       // KEY_HENKAN
+        0x7B => 94,                       // KEY_MUHENKAN
+        0x7D => 124,                      // KEY_YEN
+        0x7E => 121,                      // KEY_KPCOMMA
+        0xF1 => 123,                      // KEY_HANJA
+        0xF2 => 122,                      // KEY_HANGEUL
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set1_scancodes() {
+        assert_eq!(evdev_from_set1(0x1E, false, 0x41), Some(30)); // A
+        assert_eq!(evdev_from_set1(0x1C, false, 0x0D), Some(KEY_ENTER));
+        assert_eq!(evdev_from_set1(0x1C, true, 0x0D), Some(96)); // keypad Enter
+        assert_eq!(evdev_from_set1(0x5B, true, 0x5B), Some(125)); // left Win
+        assert_eq!(evdev_from_set1(0x38, true, 0xA5), Some(KEY_RIGHTALT));
+        assert_eq!(evdev_from_set1(0x4B, true, 0x25), Some(105)); // Left arrow
+        assert_eq!(evdev_from_set1(0x4B, false, 0x64), Some(75)); // keypad 4
+        assert_eq!(evdev_from_set1(0x45, false, VK_PAUSE), Some(119));
+        assert_eq!(evdev_from_set1(0x45, true, VK_NUMLOCK), Some(69));
+        assert_eq!(evdev_from_set1(0x57, false, 0x7A), Some(87)); // F11
+        assert_eq!(evdev_from_set1(0x2A, true, 0xFF), None); // fake shift
+    }
+
+    /// The set-1 table and the KeyCode table agree, checked against
+    /// winit's own reading of Windows scancodes (0xE0 prefix as 0xE000).
+    #[cfg(windows)]
+    #[test]
+    fn set1_table_matches_winit_windows_conversion() {
+        use winit::keyboard::PhysicalKey;
+        use winit::platform::scancode::PhysicalKeyExtScancode;
+
+        for extended in [false, true] {
+            for scan in 1..0x100u32 {
+                // Pause/Num Lock depend on the virtual key; checked above.
+                if scan == 0x45 {
+                    continue;
+                }
+                let raw = if extended { 0xE000 | scan } else { scan };
+                let PhysicalKey::Code(code) = PhysicalKey::from_scancode(raw) else {
+                    continue;
+                };
+                let Some(want) = evdev_key(code) else {
+                    continue;
+                };
+                assert_eq!(
+                    evdev_from_set1(scan, extended, 0),
+                    Some(want),
+                    "{code:?} (scancode {raw:#x})"
+                );
+            }
+        }
+    }
 
     #[test]
     fn letters_and_editing_keys() {

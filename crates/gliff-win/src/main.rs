@@ -5,6 +5,8 @@
 //! It stays a console program on purpose: ssh asks for host keys and
 //! passwords on the console, and the server's log lands there.
 
+#[cfg(windows)]
+mod capture;
 mod keys;
 mod net;
 mod view;
@@ -24,7 +26,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
-use winit::window::{CustomCursor, Window, WindowId};
+use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
 use net::{Endpoint, Event, Picture, Slot};
 
@@ -57,7 +59,16 @@ struct Cli {
     /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
     #[arg(long)]
     output: Option<String>,
+    /// Start full screen. Ctrl+Alt+Enter toggles it at any time.
+    #[arg(long)]
+    fullscreen: bool,
 }
+
+/// How to drive the window from the keyboard, printed once connected.
+const KEY_HELP: &str = "While this window is in front, every key goes to the remote, \
+Win and Alt+Tab included (Windows keeps only Ctrl+Alt+Del and Win+L).\n\
+  Ctrl+Alt+Enter  toggle full screen\n\
+  Shift+Esc       give the keyboard back to Windows; click the picture to take it again";
 
 impl Cli {
     fn endpoint(&self) -> Endpoint {
@@ -106,6 +117,13 @@ struct App {
     resize_sent: Option<((u32, u32), f64)>,
     video: String,
     exit_error: Option<String>,
+    /// The keyboard was handed back with the release hotkey; a click on the
+    /// picture takes it again.
+    released: bool,
+    /// The Windows keyboard hook. While it is installed it is the only
+    /// source of keys; winit's own key events are ignored.
+    #[cfg(windows)]
+    hook: Option<capture::Hook>,
 }
 
 impl App {
@@ -124,6 +142,72 @@ impl App {
             resize_sent: None,
             video: String::new(),
             exit_error: None,
+            released: false,
+            #[cfg(windows)]
+            hook: None,
+        }
+    }
+
+    fn hooked(&self) -> bool {
+        #[cfg(windows)]
+        return self.hook.is_some();
+        #[cfg(not(windows))]
+        return false;
+    }
+
+    /// A key from the hook or from winit, as an evdev code. Handles the two
+    /// local hotkeys; everything else goes to the remote.
+    fn on_key(&mut self, keycode: u32, pressed: bool) {
+        if self.released {
+            return;
+        }
+        if pressed {
+            let held = |a, b| self.pressed.contains(&a) || self.pressed.contains(&b);
+            let ctrl = held(keys::KEY_LEFTCTRL, keys::KEY_RIGHTCTRL);
+            let alt = held(keys::KEY_LEFTALT, keys::KEY_RIGHTALT);
+            let shift = held(keys::KEY_LEFTSHIFT, keys::KEY_RIGHTSHIFT);
+            if keycode == keys::KEY_ENTER && ctrl && alt {
+                self.toggle_fullscreen();
+                return;
+            }
+            if keycode == keys::KEY_ESC && shift && !ctrl && !alt {
+                self.release_capture();
+                return;
+            }
+        }
+        // Never send a release whose press was not sent, nor a repeat: the
+        // remote compositor repeats held keys on its own.
+        let changed = if pressed {
+            self.pressed.insert(keycode)
+        } else {
+            self.pressed.remove(&keycode)
+        };
+        if changed {
+            self.send(ClientMsg::Key { keycode, pressed });
+        }
+    }
+
+    fn toggle_fullscreen(&self) {
+        if let Some(gfx) = &self.gfx {
+            let full = gfx.window.fullscreen().is_some();
+            gfx.window
+                .set_fullscreen((!full).then_some(Fullscreen::Borderless(None)));
+        }
+    }
+
+    fn release_capture(&mut self) {
+        self.release_keys();
+        self.released = true;
+        #[cfg(windows)]
+        capture::set_active(false);
+        eprintln!("gliff: keyboard handed back; click the picture to capture it again");
+    }
+
+    fn recapture(&mut self) {
+        if self.released {
+            self.released = false;
+            #[cfg(windows)]
+            capture::set_active(true);
         }
     }
 
@@ -311,7 +395,8 @@ impl ApplicationHandler<Event> for App {
         }
         let attrs = Window::default_attributes()
             .with_title(format!("{APP_NAME} — {}", self.cli.machine()))
-            .with_inner_size(LogicalSize::new(1600.0, 900.0));
+            .with_inner_size(LogicalSize::new(1600.0, 900.0))
+            .with_fullscreen(self.cli.fullscreen.then_some(Fullscreen::Borderless(None)));
         let gfx = event_loop
             .create_window(attrs)
             .map_err(anyhow::Error::from)
@@ -324,7 +409,13 @@ impl ApplicationHandler<Event> for App {
                 Ok(Gfx { window, surface })
             });
         match gfx {
-            Ok(gfx) => self.gfx = Some(gfx),
+            Ok(gfx) => {
+                #[cfg(windows)]
+                {
+                    self.hook = install_hook(&gfx.window, self.proxy.clone());
+                }
+                self.gfx = Some(gfx);
+            }
             Err(e) => {
                 self.exit_error = Some(format!("cannot open a window: {e:#}"));
                 event_loop.exit();
@@ -357,6 +448,7 @@ impl ApplicationHandler<Event> for App {
                 self.headless = headless;
                 self.video = video;
                 if first {
+                    eprintln!("gliff: connected. {KEY_HELP}");
                     self.set_title(&self.video);
                     if headless {
                         if let Some(gfx) = &self.gfx {
@@ -384,6 +476,7 @@ impl ApplicationHandler<Event> for App {
                 hot_y,
                 argb,
             } => self.set_cursor(event_loop, width, height, (hot_x, hot_y), &argb),
+            Event::Key { keycode, pressed } => self.on_key(keycode, pressed),
             Event::Error(e) => {
                 self.exit_error = Some(e);
                 event_loop.exit();
@@ -408,8 +501,7 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Focused(false) => self.release_keys(),
             WindowEvent::KeyboardInput { event, .. } => {
-                // The remote compositor repeats held keys on its own.
-                if event.repeat {
+                if self.hooked() || event.repeat {
                     return;
                 }
                 let PhysicalKey::Code(code) = event.physical_key else {
@@ -419,22 +511,19 @@ impl ApplicationHandler<Event> for App {
                     tracing::debug!(?code, "no evdev code for key");
                     return;
                 };
-                let pressed = event.state == ElementState::Pressed;
-                // Never send a release whose press was not sent.
-                let changed = if pressed {
-                    self.pressed.insert(keycode)
-                } else {
-                    self.pressed.remove(&keycode)
-                };
-                if changed {
-                    self.send(ClientMsg::Key { keycode, pressed });
-                }
+                self.on_key(keycode, event.state == ElementState::Pressed);
             }
             WindowEvent::CursorMoved { position, .. } => self.pointer_motion(position),
-            WindowEvent::MouseInput { state, button, .. } => self.send(ClientMsg::PointerButton {
-                button: keys::evdev_button(button),
-                pressed: state == ElementState::Pressed,
-            }),
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                if pressed {
+                    self.recapture();
+                }
+                self.send(ClientMsg::PointerButton {
+                    button: keys::evdev_button(button),
+                    pressed,
+                });
+            }
             WindowEvent::MouseWheel { delta, .. } => self.scroll(delta),
             _ => {}
         }
@@ -450,6 +539,22 @@ impl ApplicationHandler<Event> for App {
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
+}
+
+/// Install the keyboard hook for `window`, or `None` to fall back to
+/// winit's key events, which Windows filters (no Win key, no Alt+Tab).
+#[cfg(windows)]
+fn install_hook(window: &Window, proxy: EventLoopProxy<Event>) -> Option<capture::Hook> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let hwnd = match window.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+        _ => return None,
+    };
+    let hook = capture::install(hwnd, proxy);
+    if hook.is_none() {
+        tracing::warn!("cannot install the keyboard hook; Win and Alt+Tab stay local");
+    }
+    hook
 }
 
 fn main() -> std::process::ExitCode {

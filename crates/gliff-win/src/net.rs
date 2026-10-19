@@ -73,6 +73,13 @@ pub enum Event {
         /// B, G, R, A bytes per pixel.
         argb: Vec<u8>,
     },
+    /// A key the Windows keyboard hook captured, as an evdev code. Not from
+    /// the worker, but it shares the event loop's one user-event type.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Key {
+        keycode: u32,
+        pressed: bool,
+    },
     Error(String),
     Closed,
 }

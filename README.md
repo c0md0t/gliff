@@ -126,7 +126,15 @@ gliff-win.exe --headless user@host
 
 Run it from a terminal: ssh asks for host keys and passwords there, and
 the server's messages show up there too. It takes `--headless`,
-`--output` and `--server-bin` like `gliff`. So far it has no clipboard,
+`--output` and `--server-bin` like `gliff`, and `--fullscreen`.
+
+While its window is in front, every key goes to the remote, including
+Win, Alt+Tab and Ctrl+Esc, so Hyprland's Super shortcuts work. Windows
+keeps only Ctrl+Alt+Del and Win+L. Ctrl+Alt+Enter toggles full screen,
+and Shift+Esc gives the keyboard back to Windows until you click the
+picture again.
+
+So far it has no clipboard,
 tabs or reconnection. Video is a single 4:2:0 stream, and the remote uses
 its own keyboard layout. The CI's Windows job builds `gliff-win.exe` as a
 download.
