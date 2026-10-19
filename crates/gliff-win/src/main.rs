@@ -682,6 +682,10 @@ fn main() -> std::process::ExitCode {
         )
         .init();
     let mut cli = Cli::parse();
+    // Which build this is, so a report can be matched to a commit (CI sets
+    // GITHUB_SHA while building).
+    let build = option_env!("GITHUB_SHA").map_or("local build", |s| &s[..s.len().min(7)]);
+    eprintln!("gliff-win {} ({build})", env!("CARGO_PKG_VERSION"));
     if cli.install {
         #[cfg(windows)]
         return match setup::install() {
