@@ -1,0 +1,477 @@
+//! A portable gliff client: a winit window, a softbuffer blit, and the CPU
+//! (OpenH264) decode tier. Built for Windows, where the GTK client's
+//! VA-API, dmabuf and Wayland paths do not exist; it runs on Linux too.
+//!
+//! It stays a console program on purpose: ssh asks for host keys and
+//! passwords on the console, and the server's log lands there.
+
+mod keys;
+mod net;
+mod view;
+
+use std::collections::HashSet;
+use std::num::NonZeroU32;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use clap::Parser;
+use gliff_proto::{Axis, ClientMsg};
+use gliff_transport::SshTarget;
+use tokio::sync::mpsc::UnboundedSender;
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::PhysicalKey;
+use winit::window::{CustomCursor, Window, WindowId};
+
+use net::{Endpoint, Event, Picture, Slot};
+
+const APP_NAME: &str = "gliff";
+
+/// A window size must hold this long before the server is asked to match
+/// it, so a drag-resize does not resize the remote output on every step.
+const RESIZE_SETTLE: Duration = Duration::from_millis(200);
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "gliff-win",
+    version,
+    about = "Remote-desktop a Hyprland session over ssh"
+)]
+struct Cli {
+    /// `user@host` (or an ssh config alias) to ssh to and spawn gliff-server.
+    #[arg(required_unless_present = "connect")]
+    host: Option<String>,
+    /// Dev: connect directly to a `gliff-server --listen` address.
+    #[arg(long, conflicts_with = "host")]
+    connect: Option<String>,
+    /// Remote gliff-server path.
+    #[arg(long, default_value = "gliff-server")]
+    server_bin: String,
+    /// Create a private headless output on the remote, sized and scaled to
+    /// this window, instead of mirroring the remote's focused screen.
+    #[arg(long, conflicts_with = "output")]
+    headless: bool,
+    /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
+    #[arg(long)]
+    output: Option<String>,
+}
+
+impl Cli {
+    fn endpoint(&self) -> Endpoint {
+        if let Some(addr) = &self.connect {
+            return Endpoint::Tcp(addr.clone());
+        }
+        let mut t = SshTarget::new(self.host.clone().unwrap_or_default());
+        t.server_bin = self.server_bin.clone();
+        t.server_args = match (&self.output, self.headless) {
+            (Some(name), _) => vec!["--output".into(), name.clone()],
+            (None, true) => vec!["--headless".into()],
+            (None, false) => vec!["--output".into(), "auto".into()],
+        };
+        Endpoint::Ssh(t)
+    }
+
+    fn machine(&self) -> &str {
+        self.connect
+            .as_deref()
+            .or(self.host.as_deref())
+            .unwrap_or_default()
+    }
+}
+
+struct Gfx {
+    window: Rc<Window>,
+    surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+}
+
+struct App {
+    cli: Cli,
+    proxy: EventLoopProxy<Event>,
+    slot: Slot,
+    gfx: Option<Gfx>,
+    input: Option<UnboundedSender<ClientMsg>>,
+    /// The picture on screen, kept to redraw on expose and resize.
+    picture: Option<Picture>,
+    /// Where `picture` was last drawn, for pointer mapping.
+    drawn: Option<view::Rect>,
+    headless: bool,
+    /// evdev codes of keys pressed on the remote, released on focus loss.
+    pressed: HashSet<u32>,
+    /// When the window size last changed, until the resize is sent.
+    resize_due: Option<Instant>,
+    /// The size and scale last sent, so an unchanged window is not resent.
+    resize_sent: Option<((u32, u32), f64)>,
+    video: String,
+    exit_error: Option<String>,
+}
+
+impl App {
+    fn new(cli: Cli, proxy: EventLoopProxy<Event>) -> Self {
+        Self {
+            cli,
+            proxy,
+            slot: Arc::new(Mutex::new(None)),
+            gfx: None,
+            input: None,
+            picture: None,
+            drawn: None,
+            headless: false,
+            pressed: HashSet::new(),
+            resize_due: None,
+            resize_sent: None,
+            video: String::new(),
+            exit_error: None,
+        }
+    }
+
+    fn send(&self, msg: ClientMsg) {
+        if let Some(tx) = &self.input {
+            let _ = tx.send(msg);
+        }
+    }
+
+    fn set_title(&self, extra: &str) {
+        if let Some(gfx) = &self.gfx {
+            let title = if extra.is_empty() {
+                format!("{APP_NAME} — {}", self.cli.machine())
+            } else {
+                format!("{APP_NAME} — {} — {extra}", self.cli.machine())
+            };
+            gfx.window.set_title(&title);
+        }
+    }
+
+    /// Send a Resize for the current window when it differs from the last
+    /// one sent. Sizes are physical and even, as the GTK client sends them.
+    fn send_resize(&mut self) {
+        self.resize_due = None;
+        let Some(gfx) = &self.gfx else {
+            return;
+        };
+        let size = gfx.window.inner_size();
+        let scale = gfx.window.scale_factor();
+        let size = (size.width & !1, size.height & !1);
+        if size.0 < 64 || size.1 < 64 || self.resize_sent == Some((size, scale)) {
+            return;
+        }
+        self.resize_sent = Some((size, scale));
+        tracing::debug!(?size, scale, "requesting resize");
+        self.send(ClientMsg::Resize {
+            width: size.0,
+            height: size.1,
+            scale: scale as f32,
+        });
+    }
+
+    /// Release every key held on the remote: once the window loses focus
+    /// their releases never reach us, and Alt-Tab would leave Alt held.
+    fn release_keys(&mut self) {
+        for keycode in std::mem::take(&mut self.pressed) {
+            self.send(ClientMsg::Key {
+                keycode,
+                pressed: false,
+            });
+        }
+    }
+
+    fn redraw(&mut self) {
+        let Some(gfx) = &mut self.gfx else {
+            return;
+        };
+        let size = gfx.window.inner_size();
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            return;
+        };
+        if let Err(e) = gfx.surface.resize(w, h) {
+            tracing::warn!(error = %e, "cannot resize the surface");
+            return;
+        }
+        let mut buffer = match gfx.surface.buffer_mut() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot map the surface");
+                return;
+            }
+        };
+        self.drawn = None;
+        match &self.picture {
+            Some(p) => {
+                let rect = view::fit(p.view, (size.width, size.height));
+                match rect {
+                    Some(rect) => {
+                        view::blit(
+                            &mut buffer,
+                            size.width as usize,
+                            &p.frame.pixels,
+                            (p.frame.width, p.frame.height),
+                            rect,
+                        );
+                        self.drawn = Some(rect);
+                    }
+                    None => buffer.fill(0),
+                }
+            }
+            None => buffer.fill(0),
+        }
+        if let Err(e) = buffer.present() {
+            tracing::warn!(error = %e, "cannot present");
+        }
+    }
+
+    fn pointer_motion(&self, pos: PhysicalPosition<f64>) {
+        let (Some(p), Some(rect)) = (&self.picture, self.drawn) else {
+            return;
+        };
+        let (x, y) = view::to_remote((pos.x, pos.y), rect, p.stream, p.scale_milli);
+        self.send(ClientMsg::PointerMotion { x, y });
+    }
+
+    fn scroll(&self, delta: MouseScrollDelta) {
+        // winit counts away from the user (wheel up) as positive; the
+        // protocol, like GTK, counts scrolling down as positive.
+        let (dx, dy) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (x as f64, -y as f64),
+            MouseScrollDelta::PixelDelta(p) => (p.x / 15.0, -p.y / 15.0),
+        };
+        for (axis, d) in [(Axis::Vertical, dy), (Axis::Horizontal, dx)] {
+            if d != 0.0 {
+                self.send(ClientMsg::PointerAxis {
+                    axis,
+                    value: d * 15.0,
+                    discrete: Some(d.signum() as i32),
+                    stop: false,
+                });
+            }
+        }
+    }
+
+    fn set_cursor(
+        &self,
+        event_loop: &ActiveEventLoop,
+        width: u32,
+        height: u32,
+        hot: (i32, i32),
+        argb: &[u8],
+    ) {
+        let Some(gfx) = &self.gfx else {
+            return;
+        };
+        match remote_cursor(width, height, hot, argb).map(|c| event_loop.create_custom_cursor(c)) {
+            Some(cursor) => {
+                gfx.window.set_cursor(cursor);
+                gfx.window.set_cursor_visible(true);
+            }
+            // A headless session's frames carry the compositor-drawn
+            // cursor; showing ours as well would give two pointers.
+            None if self.headless => gfx.window.set_cursor_visible(false),
+            None => {
+                gfx.window.set_cursor(winit::window::CursorIcon::Default);
+                gfx.window.set_cursor_visible(true);
+            }
+        }
+    }
+}
+
+/// The remote cursor image (B, G, R, A bytes), or `None` when it has no
+/// visible shape: fully transparent, or one flat colour as Hyprland sends
+/// when it has no image to share.
+fn remote_cursor(
+    width: u32,
+    height: u32,
+    hot: (i32, i32),
+    argb: &[u8],
+) -> Option<winit::window::CustomCursorSource> {
+    let needed = width as u64 * height as u64 * 4;
+    if width == 0 || height == 0 || width > 1024 || height > 1024 || (argb.len() as u64) < needed {
+        return None;
+    }
+    let argb = &argb[..needed as usize];
+    let mut pixels = argb.chunks_exact(4);
+    let first = pixels.next()?;
+    let opaque = first[3] != 0 || pixels.clone().any(|p| p[3] != 0);
+    if !opaque || pixels.all(|p| p == first) {
+        return None;
+    }
+    let rgba: Vec<u8> = argb
+        .chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect();
+    let hot_x = hot.0.clamp(0, width as i32 - 1) as u16;
+    let hot_y = hot.1.clamp(0, height as i32 - 1) as u16;
+    CustomCursor::from_rgba(rgba, width as u16, height as u16, hot_x, hot_y).ok()
+}
+
+impl ApplicationHandler<Event> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gfx.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes()
+            .with_title(format!("{APP_NAME} — {}", self.cli.machine()))
+            .with_inner_size(LogicalSize::new(1600.0, 900.0));
+        let gfx = event_loop
+            .create_window(attrs)
+            .map_err(anyhow::Error::from)
+            .and_then(|window| {
+                let window = Rc::new(window);
+                let context = softbuffer::Context::new(window.clone())
+                    .map_err(|e| anyhow::anyhow!("softbuffer context: {e}"))?;
+                let surface = softbuffer::Surface::new(&context, window.clone())
+                    .map_err(|e| anyhow::anyhow!("softbuffer surface: {e}"))?;
+                Ok(Gfx { window, surface })
+            });
+        match gfx {
+            Ok(gfx) => self.gfx = Some(gfx),
+            Err(e) => {
+                self.exit_error = Some(format!("cannot open a window: {e:#}"));
+                event_loop.exit();
+                return;
+            }
+        }
+        self.set_title("connecting…");
+        self.input = Some(net::spawn(
+            self.cli.endpoint(),
+            self.proxy.clone(),
+            self.slot.clone(),
+        ));
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+        match event {
+            Event::Frame => {
+                let picture = self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(p) = picture {
+                    self.picture = Some(p);
+                    if let Some(gfx) = &self.gfx {
+                        gfx.window.request_redraw();
+                    }
+                }
+            }
+            Event::Connected { video, headless } => {
+                let first = self.video.is_empty();
+                self.headless = headless;
+                self.video = video;
+                if first {
+                    self.set_title(&self.video);
+                    if headless {
+                        if let Some(gfx) = &self.gfx {
+                            gfx.window.set_cursor_visible(false);
+                        }
+                    }
+                    // Fit the remote to this window straight away.
+                    self.send_resize();
+                }
+            }
+            Event::Stats {
+                fps,
+                mbit,
+                decode_ms,
+            } => {
+                self.set_title(&format!(
+                    "{} · {fps:.0} fps · {mbit:.1} Mbit/s · decode {decode_ms:.1} ms",
+                    self.video
+                ));
+            }
+            Event::Cursor {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb,
+            } => self.set_cursor(event_loop, width, height, (hot_x, hot_y), &argb),
+            Event::Error(e) => {
+                self.exit_error = Some(e);
+                event_loop.exit();
+            }
+            Event::Closed => event_loop.exit(),
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                self.release_keys();
+                self.input = None;
+                event_loop.exit();
+            }
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.resize_due = Some(Instant::now() + RESIZE_SETTLE);
+                if let Some(gfx) = &self.gfx {
+                    gfx.window.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Focused(false) => self.release_keys(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                // The remote compositor repeats held keys on its own.
+                if event.repeat {
+                    return;
+                }
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                let Some(keycode) = keys::evdev_key(code) else {
+                    tracing::debug!(?code, "no evdev code for key");
+                    return;
+                };
+                let pressed = event.state == ElementState::Pressed;
+                // Never send a release whose press was not sent.
+                let changed = if pressed {
+                    self.pressed.insert(keycode)
+                } else {
+                    self.pressed.remove(&keycode)
+                };
+                if changed {
+                    self.send(ClientMsg::Key { keycode, pressed });
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => self.pointer_motion(position),
+            WindowEvent::MouseInput { state, button, .. } => self.send(ClientMsg::PointerButton {
+                button: keys::evdev_button(button),
+                pressed: state == ElementState::Pressed,
+            }),
+            WindowEvent::MouseWheel { delta, .. } => self.scroll(delta),
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.resize_due {
+            Some(due) if Instant::now() >= due => {
+                self.send_resize();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some(due) => event_loop.set_control_flow(ControlFlow::WaitUntil(due)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    let cli = Cli::parse();
+    let event_loop = match EventLoop::<Event>::with_user_event().build() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("gliff: cannot start the event loop: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let mut app = App::new(cli, event_loop.create_proxy());
+    if let Err(e) = event_loop.run_app(&mut app) {
+        eprintln!("gliff: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    match app.exit_error {
+        Some(e) => {
+            eprintln!("gliff: {e}");
+            std::process::ExitCode::FAILURE
+        }
+        None => std::process::ExitCode::SUCCESS,
+    }
+}

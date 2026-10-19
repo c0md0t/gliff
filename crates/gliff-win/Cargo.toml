@@ -1,0 +1,23 @@
+[package]
+name = "gliff-win"
+description = "Portable gliff client (winit + softbuffer, CPU decode), built for Windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+gliff-proto.workspace = true
+gliff-transport.workspace = true
+gliff-sw.workspace = true
+winit = "0.30"
+softbuffer = "0.4"

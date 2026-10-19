@@ -113,6 +113,24 @@ room. Two flags change the video, and you pass them to the server through
 gliff --server-bin 'gliff-server --low-bandwidth' user@host
 ```
 
+## From Windows
+
+`gliff-win` is a smaller client for machines without Hyprland, built for
+Windows. It uses Windows' own OpenSSH (`ssh.exe`) to start `gliff-server`
+on the remote, the same way `gliff` does, and decodes on the CPU:
+
+```
+gliff-win.exe user@host
+gliff-win.exe --headless user@host
+```
+
+Run it from a terminal: ssh asks for host keys and passwords there, and
+the server's messages show up there too. It takes `--headless`,
+`--output` and `--server-bin` like `gliff`. So far it has no clipboard,
+tabs or reconnection. Video is a single 4:2:0 stream, and the remote uses
+its own keyboard layout. The CI's Windows job builds `gliff-win.exe` as a
+download.
+
 ## If something does not work
 
 - Run `gliff-probe all` on each machine. It checks the compositor, the GPU
