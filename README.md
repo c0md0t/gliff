@@ -155,7 +155,9 @@ keeps only Ctrl+Alt+Del and Win+L. Ctrl+Alt+Enter toggles full screen,
 and Shift+Esc gives the keyboard back to Windows until you click the
 picture again.
 
-So far it has no tabs, no copied files, and no sound, and the remote uses
+It plays the remote's sound when the server supports it (`--no-audio` to
+keep quiet). It remembers `--server-bin`, so a shortcut reaches the same
+server. So far it has no tabs and no copied files, and the remote uses
 its own keyboard layout. The CI's Windows job builds `gliff-win.exe` as a
 download.
 

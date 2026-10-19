@@ -1273,6 +1273,7 @@ dependencies = [
  "arboard",
  "bytes",
  "clap",
+ "gliff-audio",
  "gliff-proto",
  "gliff-sw",
  "gliff-transport",

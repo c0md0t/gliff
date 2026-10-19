@@ -1,8 +1,10 @@
-//! Remembering the last machine, and installing for the current user.
+//! Remembering the last machine and server program, and installing for the
+//! current user.
 
 use std::path::PathBuf;
 
 const LAST_HOST: &str = "win-last-host";
+const SERVER_BIN: &str = "win-server-bin";
 
 /// Where gliff-win keeps its settings: `%APPDATA%\gliff` on Windows, the
 /// XDG config directory elsewhere.
@@ -17,22 +19,40 @@ fn config_dir() -> Option<PathBuf> {
     Some(base.join("gliff"))
 }
 
-/// The machine connected to last time.
-pub fn last_host() -> Option<String> {
-    let text = std::fs::read_to_string(config_dir()?.join(LAST_HOST)).ok()?;
-    let host = text.trim();
-    (!host.is_empty()).then(|| host.to_string())
+fn recall(name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config_dir()?.join(name)).ok()?;
+    let value = text.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
-pub fn remember_host(host: &str) {
+fn remember(name: &str, value: &str) {
     let Some(dir) = config_dir() else {
         return;
     };
     if let Err(e) = std::fs::create_dir_all(&dir)
-        .and_then(|_| std::fs::write(dir.join(LAST_HOST), format!("{host}\n")))
+        .and_then(|_| std::fs::write(dir.join(name), format!("{value}\n")))
     {
-        tracing::warn!(error = %e, "cannot remember the host");
+        tracing::warn!(error = %e, name, "cannot remember a setting");
     }
+}
+
+/// The machine connected to last time.
+pub fn last_host() -> Option<String> {
+    recall(LAST_HOST)
+}
+
+pub fn remember_host(host: &str) {
+    remember(LAST_HOST, host);
+}
+
+/// The server program last given with `--server-bin`, so a shortcut
+/// without it reaches the same server (say, a newer build in `~/bin`).
+pub fn server_bin() -> Option<String> {
+    recall(SERVER_BIN)
+}
+
+pub fn remember_server_bin(path: &str) {
+    remember(SERVER_BIN, path);
 }
 
 /// Ask on the console which machine to connect to.

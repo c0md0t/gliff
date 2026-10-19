@@ -17,8 +17,8 @@ use anyhow::Context;
 use bytes::Bytes;
 use gliff_proto::clipboard::{resolve_mime, CHUNK, MAX_ITEM, TEXT_MIME};
 use gliff_proto::{
-    features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardItem,
-    ClipboardMsg, Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
+    features, is_incompatible, version_mismatch, AudioCodec, ChromaMode, ClientCaps, ClientMsg,
+    ClipboardItem, ClipboardMsg, Codec, ServerMsg, VideoPipeline, FEATURE_AUDIO, PROTOCOL_VERSION,
 };
 use gliff_transport::clipboard::{
     outbound_channel, ChunkSink, Event as TransferEvent, Side, Transfers,
@@ -35,6 +35,8 @@ use winit::event_loop::EventLoopProxy;
 type Geometry = ((u32, u32), (u32, u32), u32);
 
 const MAX_STREAM: (u32, u32) = (3840, 2160);
+/// Opus at 128 kbit/s makes 10 ms packets of about 160 bytes.
+const MAX_AUDIO_PACKET: u32 = 4000;
 // Older protocol-v1 GPU servers ignore the advertised limits on their first
 // stream. Accept their bounded encoder maximum so they can reach the resize.
 const MAX_DECODE: (u32, u32) = (4096, 4096);
@@ -128,6 +130,8 @@ pub struct Options {
     /// Ask for 4:4:4 colour (two 4:2:0 streams, recombined here) for
     /// sharper text, at the cost of a second decode per frame.
     pub full_chroma: bool,
+    /// Play the server's sound when it offers it.
+    pub audio: bool,
 }
 
 /// What every session of one run shares.
@@ -137,6 +141,7 @@ struct Ctx {
     input: UnboundedReceiver<ClientMsg>,
     clip: Option<ClipIo>,
     full_chroma: bool,
+    audio: bool,
 }
 
 /// The session's end of the clipboard thread.
@@ -236,6 +241,7 @@ fn run(
             None
         },
         full_chroma: options.full_chroma,
+        audio: options.audio,
     };
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -389,15 +395,20 @@ where
     // so its round-trip estimate is seeded before the first frame.
     let mut got_ack = false;
     let mut headless = false;
+    let mut server_audio = false;
     let (mut width, mut height, mut chroma, mut scale_milli, pipeline, mut view) = loop {
         match reader.read_msg::<ServerMsg>().await? {
             ServerMsg::HelloAck {
-                version, session, ..
+                version,
+                session,
+                features,
+                ..
             } => {
                 if version != PROTOCOL_VERSION {
                     return Err(fatal(version_mismatch(PROTOCOL_VERSION, version)));
                 }
                 headless = session.headless;
+                server_audio = features.iter().any(|f| f == FEATURE_AUDIO);
                 got_ack = true;
             }
             ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
@@ -454,6 +465,14 @@ where
     let send = |m: ClientMsg| {
         let _ = out_tx.send((m, Bytes::new()));
     };
+
+    // Sound plays while on: ask a server that has it to start, and open
+    // the output device on its AudioStart.
+    let audio_on = ctx.audio && server_audio;
+    if audio_on {
+        send(ClientMsg::Audio { enabled: true });
+    }
+    let mut sound = gliff_audio::Sink::default();
 
     // Clipboard transfers write through the same channel, in chunks.
     let (clip_out_tx, mut clip_out_rx) = outbound_channel();
@@ -632,6 +651,26 @@ where
             ServerMsg::Ping { t } => {
                 send(ClientMsg::Pong { t });
             }
+            ServerMsg::AudioStart {
+                codec,
+                sample_rate,
+                channels,
+            } => {
+                if audio_on {
+                    sound.start(codec == AudioCodec::Opus, sample_rate, channels);
+                }
+            }
+            ServerMsg::AudioFrame { seq, data_len } => {
+                anyhow::ensure!(
+                    data_len <= MAX_AUDIO_PACKET,
+                    "audio packet of {data_len} bytes exceeds the limit"
+                );
+                // Read even when not playing, to keep the framing in step.
+                let packet = reader.read_payload(data_len).await?;
+                if audio_on {
+                    sound.frame(seq, &packet);
+                }
+            }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::HelloAck { .. } => {}
             ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
                 return Err(fatal(format!("incompatible server: {message}")))
@@ -708,7 +747,7 @@ where
             } else {
                 0.0
             };
-            tracing::debug!(fps, mbit, decode_ms, ?chroma, width, height, "stats");
+            tracing::debug!(fps, mbit, decode_ms, ?chroma, width, height, audio = ?sound.stats(), "stats");
             let _ = events.send_event(Event::Stats {
                 fps,
                 mbit,

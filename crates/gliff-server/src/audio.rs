@@ -149,7 +149,7 @@ fn recorder() -> Result<(Child, Option<Linker>)> {
 /// Programs whose playback is never recorded: the Gliff client plays the
 /// other machine's sound, and sending that back would echo forever when two
 /// machines show each other.
-const EXCLUDED: &[&str] = &["gliff"];
+const EXCLUDED: &[&str] = &["gliff", "gliff-win"];
 
 /// Links every application's output into the recorder, except Gliff's own,
 /// as applications come and go: `pw-dump --monitor` reports the graph and

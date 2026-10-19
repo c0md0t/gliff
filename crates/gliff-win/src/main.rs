@@ -58,9 +58,10 @@ struct Cli {
     /// Dev: connect directly to a `gliff-server --listen` address.
     #[arg(long, conflicts_with = "host")]
     connect: Option<String>,
-    /// Remote gliff-server path.
-    #[arg(long, default_value = "gliff-server")]
-    server_bin: String,
+    /// Remote gliff-server path. Remembered for later runs; without it, the
+    /// one given last time, else `gliff-server`.
+    #[arg(long)]
+    server_bin: Option<String>,
     /// Create a private headless output on the remote, sized and scaled to
     /// this window, instead of mirroring the remote's focused screen.
     #[arg(long, conflicts_with = "output")]
@@ -71,6 +72,9 @@ struct Cli {
     /// Disable clipboard sharing in both directions.
     #[arg(long)]
     no_clipboard: bool,
+    /// Do not play the remote machine's sound.
+    #[arg(long)]
+    no_audio: bool,
     /// Colour detail: `444` for sharp text (two streams to decode) or
     /// `420` for half the decode work.
     #[arg(long, default_value = "444", value_parser = ["444", "420"])]
@@ -96,7 +100,9 @@ impl Cli {
             return Endpoint::Tcp(addr.clone());
         }
         let mut t = SshTarget::new(self.host.clone().unwrap_or_default());
-        t.server_bin = self.server_bin.clone();
+        if let Some(bin) = &self.server_bin {
+            t.server_bin = bin.clone();
+        }
         // Notice a dead link (a laptop waking from sleep) within about 15 s,
         // so the session can reconnect instead of hanging.
         t.ssh_args = [
@@ -489,6 +495,7 @@ impl ApplicationHandler<Event> for App {
             net::Options {
                 clipboard: !self.cli.no_clipboard,
                 full_chroma: self.cli.chroma == "444",
+                audio: !self.cli.no_audio,
             },
         ));
     }
@@ -689,6 +696,10 @@ fn main() -> std::process::ExitCode {
             eprintln!("gliff: --install is for Windows");
             return std::process::ExitCode::FAILURE;
         }
+    }
+    match &cli.server_bin {
+        Some(bin) => setup::remember_server_bin(bin),
+        None => cli.server_bin = setup::server_bin(),
     }
     if cli.host.is_none() && cli.connect.is_none() && !cli.probe_keys {
         cli.host = setup::last_host().or_else(setup::ask_host);
